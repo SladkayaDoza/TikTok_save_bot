@@ -450,10 +450,10 @@ async def _download_image_list(image_urls: list[str], source_name: str) -> list[
 
 
 async def analyze_tiktok_content(url: str) -> TikTokContent:
-    """Анализирует TikTok URL через tikwm API.
-    Определяет тип контента (фото/видео), извлекает прямые ссылки,
-    и для фото — скачивает файлы. Для видео — возвращает direct URL
-    для быстрого скачивания без yt-dlp."""
+    """Анализирует TikTok URL через tikwm API (быстро, с таймаутами).
+    Определяет тип контента (фото/видео), извлекает прямые ссылки.
+    Для фото — скачивает файлы. Для видео — возвращает direct URL.
+    НЕ использует yt-dlp для анализа — только лёгкие HTTP API."""
 
     result = TikTokContent()
 
@@ -462,17 +462,18 @@ async def analyze_tiktok_content(url: str) -> TikTokContent:
 
     session = await get_http_session()
 
-    # --- Метод 1: tikwm.com API (основной — определяет тип + даёт прямые ссылки) ---
+    # --- Метод 1: tikwm.com API (основной) — таймаут 4 сек ---
     try:
         api_url = "https://www.tikwm.com/api/"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        async with session.post(api_url, data={"url": url, "hd": 1}, headers=headers) as resp:
+        timeout = aiohttp.ClientTimeout(total=4)
+        async with session.post(api_url, data={"url": url, "hd": 1}, headers=headers, timeout=timeout) as resp:
             if resp.status == 200:
                 api_data = await resp.json()
                 if api_data.get("code") == 0:
                     data = api_data.get("data", {})
 
-                    # Извлекаем video_source_id из API ответа (работает даже для коротких ссылок)
+                    # Извлекаем video_source_id из API (работает даже для vm.tiktok.com)
                     tiktok_id = data.get("id")
                     if tiktok_id:
                         result.video_source_id = f"tiktok:{tiktok_id}"
@@ -487,34 +488,37 @@ async def analyze_tiktok_content(url: str) -> TikTokContent:
                             if downloaded:
                                 result.content_type = "photos"
                                 result.photo_paths = downloaded
-                                result.direct_url = real_images[0]  # Сохраняем первое фото как direct_url
+                                result.direct_url = real_images[0]
                                 logging.info(f"TikTok photo slideshow via tikwm: {len(downloaded)} photos")
                                 return result
                     else:
                         # ===== ВИДЕО-ПОСТ =====
-                        # tikwm отдаёт прямые ссылки на видео — используем их вместо yt-dlp!
                         video_url = data.get("hdplay") or data.get("play")
                         if video_url and video_url.startswith("http"):
                             result.content_type = "video"
                             result.video_url = video_url
                             result.direct_url = data.get("play") or video_url
-                            logging.info(f"TikTok video direct URL obtained via tikwm")
+                            logging.info(f"TikTok video direct URL via tikwm (fast path)")
                             return result
                         else:
-                            logging.debug(f"tikwm: video post but no play URL — will fallback to yt-dlp")
+                            # tikwm определил что видео, но не дал ссылку — yt-dlp скачает
                             result.content_type = "video"
+                            logging.debug(f"tikwm: video post, no play URL — yt-dlp fallback")
                             return result
+    except asyncio.TimeoutError:
+        logging.warning(f"tikwm API timeout (4s) for {url}")
     except Exception as e:
         logging.debug(f"tikwm API failed for {url}: {e}")
 
-    # --- Метод 2: tikcdn.io API (резервный, только для фото) ---
+    # --- Метод 2: tikcdn.io API (резервный, только фото) — таймаут 3 сек ---
     try:
         api_url = "https://tikcdn.io/ssstik/video"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Content-Type": "application/x-www-form-urlencoded",
         }
-        async with session.post(api_url, data={"id": url, "locale": "en", "tt": "1"}, headers=headers) as resp:
+        timeout = aiohttp.ClientTimeout(total=3)
+        async with session.post(api_url, data={"id": url, "locale": "en", "tt": "1"}, headers=headers, timeout=timeout) as resp:
             if resp.status == 200:
                 text = await resp.text()
                 img_matches = re.findall(r'https?://[^\s"\'<>]+\.(?:jpg|jpeg|png|webp)[^\s"\'<>]*', text)
@@ -524,54 +528,13 @@ async def analyze_tiktok_content(url: str) -> TikTokContent:
                         result.content_type = "photos"
                         result.photo_paths = downloaded
                         return result
+    except asyncio.TimeoutError:
+        logging.warning(f"tikcdn API timeout (3s) for {url}")
     except Exception as e:
         logging.debug(f"tikcdn API failed for {url}: {e}")
 
-    # --- Метод 3: yt-dlp fallback (для слайдшоу, когда tikwm не сработал) ---
-    try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'skip_download': True,
-        }
-        info = await asyncio.to_thread(
-            lambda: yt_dlp.YoutubeDL(ydl_opts).extract_info(url, download=False)
-        )
-
-        if not info:
-            return result
-
-        info_type = info.get("_type", "")
-        if info_type != "playlist":
-            logging.debug(f"yt-dlp: _type='{info_type}' (not playlist) — video, not slideshow")
-            result.content_type = "video"
-            return result
-
-        image_urls = []
-        entries = info.get("entries")
-        if entries:
-            entries_list = list(entries)
-            for entry in entries_list:
-                if not entry:
-                    continue
-                img_url = entry.get("url") or entry.get("webpage_url")
-                thumbnails = entry.get("thumbnails", [])
-                if thumbnails:
-                    best = max(thumbnails, key=lambda t: t.get("width", 0) * t.get("height", 0))
-                    img_url = best.get("url", img_url)
-                if img_url and img_url.startswith("http"):
-                    image_urls.append(img_url)
-
-        if image_urls:
-            downloaded = await _download_image_list(image_urls[:10], "yt-dlp")
-            if downloaded:
-                result.content_type = "photos"
-                result.photo_paths = downloaded
-                return result
-
-    except Exception as e:
-        logging.debug(f"yt-dlp photo extraction failed for {url}: {e}")
-
+    # Оба API не сработали — возвращаем "unknown", process_url скачает через yt-dlp
+    logging.debug(f"All TikTok APIs failed for {url}, falling back to yt-dlp download")
     return result
 
 
