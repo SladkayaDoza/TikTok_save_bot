@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import random
 import glob
@@ -7,6 +8,7 @@ import html
 import re
 import json
 import uuid
+from dataclasses import dataclass, field
 import subprocess
 import requests as http_requests
 import aiohttp
@@ -25,7 +27,7 @@ dotenv.load_dotenv()
 
 from database import (
     init_db, add_video_record, update_bot_message_id,
-    sync_reactions, get_chat_stats,
+    sync_reactions, get_chat_stats, find_duplicate,
 )
 
 # --- CONFIGURATION ---
@@ -245,6 +247,76 @@ TIKTOK_URL_REGEX = re.compile(
     r'https?://(?:www\.)?(?:tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com)'
 )
 
+
+# =====================================================================
+#  DEDUPLICATION & TIKTOK SPEEDUP HELPERS
+# =====================================================================
+
+@dataclass
+class TikTokContent:
+    """Результат анализа TikTok URL через tikwm API."""
+    content_type: str = "unknown"         # "video" | "photos" | "unknown"
+    video_url: str | None = None          # Прямая ссылка на видео (для скачивания)
+    photo_paths: list[str] = field(default_factory=list)  # Пути к скачанным фото
+    direct_url: str | None = None         # Прямая ссылка для сохранения в БД
+    video_source_id: str | None = None    # "tiktok:7234567890"
+
+
+def extract_video_source_id(url: str) -> str | None:
+    """Извлекает уникальный ID видео из URL (без HTTP-запросов).
+    Для коротких ссылок (vm.tiktok.com) возвращает None — ID будет
+    получен позже из tikwm API."""
+
+    # TikTok: /video/1234567890 or /photo/1234567890
+    m = re.search(r'tiktok\.com/.*/(?:video|photo)/(\d+)', url)
+    if m:
+        return f"tiktok:{m.group(1)}"
+
+    # YouTube: ?v=xxx or youtu.be/xxx or /shorts/xxx
+    m = re.search(r'(?:youtube\.com/.*[?&]v=|youtu\.be/|youtube\.com/shorts/)([\w-]{11})', url)
+    if m:
+        return f"youtube:{m.group(1)}"
+
+    # Instagram: /reel/xxx/ or /p/xxx/
+    m = re.search(r'instagram\.com/(?:reel|p)/([\w-]+)', url)
+    if m:
+        return f"instagram:{m.group(1)}"
+
+    return None
+
+
+def get_message_link(chat_id: int, message_id: int) -> str | None:
+    """Constructs a Telegram deep link to a specific message in a supergroup."""
+    if not message_id:
+        return None
+    if chat_id < 0:
+        # Supergroup: chat_id is -100XXXXXXXXXX → need XXXXXXXXXX
+        clean_id = str(abs(chat_id))
+        if clean_id.startswith("100"):
+            clean_id = clean_id[3:]
+        return f"https://t.me/c/{clean_id}/{message_id}"
+    return None
+
+
+async def download_video_direct(url: str, output_path: str) -> bool:
+    """Скачивает видео напрямую через aiohttp (без yt-dlp).
+    Используется для TikTok видео когда tikwm API даёт прямую ссылку."""
+    session = await get_http_session()
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                logging.warning(f"Direct download failed: HTTP {resp.status}")
+                return False
+            with open(output_path, "wb") as f:
+                async for chunk in resp.content.iter_chunked(65536):
+                    f.write(chunk)
+            return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
+    except Exception as e:
+        logging.error(f"Direct download error: {e}")
+        return False
+
+
 # =====================================================================
 #  WHISPER TRANSCRIPTION HELPERS
 # =====================================================================
@@ -346,70 +418,96 @@ def get_media_from_message(message: Message) -> tuple[str, str] | None:
 
 
 # =====================================================================
-#  TIKTOK PHOTO SLIDESHOW HELPERS
+#  TIKTOK CONTENT ANALYSIS (фото/видео определение + прямые ссылки)
 # =====================================================================
 
-async def try_get_tiktok_photos(url: str) -> list[str]:
-    """Скачивает фото из TikTok слайдшоу через tikwm.com API.
-    Обходит блокировку IP и поддерживает /photo/ посты.
-    Возвращает список путей к скачанным изображениям (пустой при ошибке)."""
+async def _download_image_list(image_urls: list[str], source_name: str) -> list[str]:
+    """Скачивает список изображений по URL. Возвращает пути к файлам."""
+    session = await get_http_session()
+    downloaded = []
+    for i, img_url in enumerate(image_urls[:10]):
+        try:
+            async with session.get(img_url) as img_resp:
+                if img_resp.status != 200:
+                    continue
+                content = await img_resp.read()
+                if not content or len(content) < 100:
+                    continue
+                ct = img_resp.headers.get("Content-Type", "")
+                ext = ".jpg"
+                if "png" in ct:
+                    ext = ".png"
+                elif "webp" in ct:
+                    ext = ".webp"
+                photo_path = os.path.join(TEMP_DIR, f"photo_{uuid.uuid4()}{ext}")
+                with open(photo_path, "wb") as f:
+                    f.write(content)
+                if os.path.getsize(photo_path) > 0:
+                    downloaded.append(photo_path)
+        except Exception as e:
+            logging.error(f"Error downloading photo {i} via {source_name}: {e}")
+    return downloaded
+
+
+async def analyze_tiktok_content(url: str) -> TikTokContent:
+    """Анализирует TikTok URL через tikwm API.
+    Определяет тип контента (фото/видео), извлекает прямые ссылки,
+    и для фото — скачивает файлы. Для видео — возвращает direct URL
+    для быстрого скачивания без yt-dlp."""
+
+    result = TikTokContent()
+
     if not TIKTOK_URL_REGEX.match(url):
-        return []
+        return result
 
     session = await get_http_session()
 
-    # Хелпер для скачивания списка image URLs
-    async def _download_image_list(image_urls: list[str], source_name: str) -> list[str]:
-        downloaded = []
-        for i, img_url in enumerate(image_urls[:10]):
-            try:
-                async with session.get(img_url) as img_resp:
-                    if img_resp.status != 200:
-                        continue
-                    content = await img_resp.read()
-                    if not content or len(content) < 100:
-                        continue
-                    ct = img_resp.headers.get("Content-Type", "")
-                    ext = ".jpg"
-                    if "png" in ct:
-                        ext = ".png"
-                    elif "webp" in ct:
-                        ext = ".webp"
-                    photo_path = os.path.join(TEMP_DIR, f"photo_{uuid.uuid4()}{ext}")
-                    with open(photo_path, "wb") as f:
-                        f.write(content)
-                    if os.path.getsize(photo_path) > 0:
-                        downloaded.append(photo_path)
-            except Exception as e:
-                logging.error(f"Error downloading photo {i} via {source_name}: {e}")
-        return downloaded
-
-    # --- Метод 1: tikwm.com API ---
+    # --- Метод 1: tikwm.com API (основной — определяет тип + даёт прямые ссылки) ---
     try:
         api_url = "https://www.tikwm.com/api/"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         async with session.post(api_url, data={"url": url, "hd": 1}, headers=headers) as resp:
             if resp.status == 200:
-                data = await resp.json()
-                if data.get("code") == 0:
-                    images = data.get("data", {}).get("images", [])
-                    # ВАЖНО: images должен быть непустым списком с реальными URL.
-                    # Для видео-постов tikwm возвращает code==0 но images=[] или None.
-                    # Если images пустой — это видео, а не фото-пост.
+                api_data = await resp.json()
+                if api_data.get("code") == 0:
+                    data = api_data.get("data", {})
+
+                    # Извлекаем video_source_id из API ответа (работает даже для коротких ссылок)
+                    tiktok_id = data.get("id")
+                    if tiktok_id:
+                        result.video_source_id = f"tiktok:{tiktok_id}"
+
+                    images = data.get("images", [])
+
                     if images and isinstance(images, list) and len(images) > 0:
-                        # Дополнительная проверка: первый элемент должен быть строкой-URL
+                        # ===== ФОТО-ПОСТ =====
                         real_images = [img for img in images if isinstance(img, str) and img.startswith("http")]
                         if real_images:
                             downloaded = await _download_image_list(real_images, "tikwm")
                             if downloaded:
-                                logging.info(f"TikTok photo slideshow detected via tikwm: {len(downloaded)} photos")
-                                return downloaded
+                                result.content_type = "photos"
+                                result.photo_paths = downloaded
+                                result.direct_url = real_images[0]  # Сохраняем первое фото как direct_url
+                                logging.info(f"TikTok photo slideshow via tikwm: {len(downloaded)} photos")
+                                return result
                     else:
-                        logging.debug(f"tikwm: code==0 but no images — this is a video post, skipping photo extraction")
+                        # ===== ВИДЕО-ПОСТ =====
+                        # tikwm отдаёт прямые ссылки на видео — используем их вместо yt-dlp!
+                        video_url = data.get("hdplay") or data.get("play")
+                        if video_url and video_url.startswith("http"):
+                            result.content_type = "video"
+                            result.video_url = video_url
+                            result.direct_url = data.get("play") or video_url
+                            logging.info(f"TikTok video direct URL obtained via tikwm")
+                            return result
+                        else:
+                            logging.debug(f"tikwm: video post but no play URL — will fallback to yt-dlp")
+                            result.content_type = "video"
+                            return result
     except Exception as e:
         logging.debug(f"tikwm API failed for {url}: {e}")
 
-    # --- Метод 2: tikcdn.io API (резервный) ---
+    # --- Метод 2: tikcdn.io API (резервный, только для фото) ---
     try:
         api_url = "https://tikcdn.io/ssstik/video"
         headers = {
@@ -419,16 +517,17 @@ async def try_get_tiktok_photos(url: str) -> list[str]:
         async with session.post(api_url, data={"id": url, "locale": "en", "tt": "1"}, headers=headers) as resp:
             if resp.status == 200:
                 text = await resp.text()
-                # Ищем прямые ссылки на изображения в ответе
                 img_matches = re.findall(r'https?://[^\s"\'<>]+\.(?:jpg|jpeg|png|webp)[^\s"\'<>]*', text)
                 if img_matches:
                     downloaded = await _download_image_list(img_matches, "tikcdn")
                     if downloaded:
-                        return downloaded
+                        result.content_type = "photos"
+                        result.photo_paths = downloaded
+                        return result
     except Exception as e:
         logging.debug(f"tikcdn API failed for {url}: {e}")
 
-    # --- Метод 3: yt-dlp fallback (для обычных слайдшоу без IP-блока) ---
+    # --- Метод 3: yt-dlp fallback (для слайдшоу, когда tikwm не сработал) ---
     try:
         ydl_opts = {
             'quiet': True,
@@ -440,22 +539,17 @@ async def try_get_tiktok_photos(url: str) -> list[str]:
         )
 
         if not info:
-            return []
+            return result
 
-        # КЛЮЧЕВАЯ ПРОВЕРКА: yt-dlp видит TikTok слайдшоу как "playlist".
-        # Обычные видео НЕ имеют _type=="playlist".
-        # Без этой проверки thumbnails/frames видео ошибочно возвращались как "фото".
         info_type = info.get("_type", "")
         if info_type != "playlist":
-            logging.debug(f"yt-dlp: _type='{info_type}' (not playlist) — this is a video, not a slideshow")
-            return []
+            logging.debug(f"yt-dlp: _type='{info_type}' (not playlist) — video, not slideshow")
+            result.content_type = "video"
+            return result
 
         image_urls = []
-
-        # entries (yt-dlp видит слайдшоу как playlist)
         entries = info.get("entries")
         if entries:
-            # Конвертируем generator в list если нужно
             entries_list = list(entries)
             for entry in entries_list:
                 if not entry:
@@ -468,16 +562,17 @@ async def try_get_tiktok_photos(url: str) -> list[str]:
                 if img_url and img_url.startswith("http"):
                     image_urls.append(img_url)
 
-        if not image_urls:
-            return []
-
-        logging.info(f"yt-dlp detected TikTok slideshow with {len(image_urls)} images")
-        downloaded = await _download_image_list(image_urls[:10], "yt-dlp")
-        return downloaded
+        if image_urls:
+            downloaded = await _download_image_list(image_urls[:10], "yt-dlp")
+            if downloaded:
+                result.content_type = "photos"
+                result.photo_paths = downloaded
+                return result
 
     except Exception as e:
         logging.debug(f"yt-dlp photo extraction failed for {url}: {e}")
-        return []
+
+    return result
 
 
 # =====================================================================
@@ -592,6 +687,18 @@ async def process_url(message: Message, url: str):
 
     domain = get_domain_name(url)
     escaped_url = html.escape(url)
+
+    # ============================================================
+    #  ДЕДУПЛИКАЦИЯ: Проверяем video_source_id до скачивания
+    # ============================================================
+    video_source_id = extract_video_source_id(url)
+    is_duplicate = False
+    duplicate_info = None
+    if video_source_id:
+        duplicate_info = find_duplicate(message.chat.id, video_source_id)
+        if duplicate_info:
+            is_duplicate = True
+
     status_html = (
         "<h3>📥 Загрузка медиа</h3>\n"
         "<p>Статус: 🟡 <b>Скачивание...</b></p>\n"
@@ -608,32 +715,60 @@ async def process_url(message: Message, url: str):
     status_msg_id = status_msg.message_id
 
     photo_files = []  # для TikTok фото — будем чистить в finally
+    direct_url_to_save = None  # Прямая ссылка для сохранения в БД
+
+    # Формируем shame-подпись для дубликатов
+    def _build_shame_caption() -> str | None:
+        if not is_duplicate or not duplicate_info:
+            return None
+        parts = ["Аяйайай бака 🫵😹, видео других не смотрит а скинул повторчик)"]
+        dup_username = html.escape(duplicate_info["username"])
+        msg_link = get_message_link(message.chat.id, duplicate_info.get("bot_message_id"))
+        if msg_link:
+            parts.append(f"Первый кинул: <a href=\"{msg_link}\">{dup_username}</a>")
+        else:
+            parts.append(f"Первый кинул: {dup_username}")
+        return "\n".join(parts)
 
     try:
         # ============================================================
-        #  TikTok: сначала пробуем скачать фото (до видео!)
-        #  Фото-посты не скачиваются через yt-dlp, поэтому проверяем
-        #  заранее через API, а не ждём ошибки download_video.
+        #  TikTok: анализ контента через tikwm API
+        #  Определяет фото/видео + даёт прямые ссылки для скачивания
         # ============================================================
         if TIKTOK_URL_REGEX.match(url):
             try:
-                photo_html = (
+                await _update_status(message.chat.id, status_msg_id, (
                     "<h3>📥 Загрузка медиа</h3>\n"
                     "<p>Статус: 🔍 <b>Определение типа контента...</b></p>\n"
                     f"<p>Источник: <a href=\"{escaped_url}\">{domain}</a></p>"
-                )
-                await _update_status(message.chat.id, status_msg_id, photo_html)
+                ))
             except Exception:
                 pass
 
-            photo_files = await try_get_tiktok_photos(url)
+            content = await analyze_tiktok_content(url)
+            direct_url_to_save = content.direct_url
 
-            if photo_files:
+            # Если tikwm дал video_source_id (работает для коротких ссылок vm.tiktok.com)
+            if not video_source_id and content.video_source_id:
+                video_source_id = content.video_source_id
+                if not is_duplicate:
+                    duplicate_info = find_duplicate(message.chat.id, video_source_id)
+                    if duplicate_info:
+                        is_duplicate = True
+
+            # --- ФОТО ---
+            if content.content_type == "photos" and content.photo_paths:
+                photo_files = content.photo_paths
+                shame_caption = _build_shame_caption()
                 try:
                     if len(photo_files) == 1:
                         photo = FSInputFile(photo_files[0])
                         await bot.edit_message_media(
-                            media=InputMediaPhoto(media=photo),
+                            media=InputMediaPhoto(
+                                media=photo,
+                                caption=shame_caption,
+                                parse_mode="HTML" if shame_caption else None,
+                            ),
                             chat_id=message.chat.id,
                             message_id=status_msg_id,
                         )
@@ -642,6 +777,13 @@ async def process_url(message: Message, url: str):
                             InputMediaPhoto(media=FSInputFile(p))
                             for p in photo_files[:10]
                         ]
+                        # Добавляем shame-подпись к первому фото
+                        if shame_caption:
+                            media_group[0] = InputMediaPhoto(
+                                media=FSInputFile(photo_files[0]),
+                                caption=shame_caption,
+                                parse_mode="HTML",
+                            )
                         await message.reply_media_group(media_group)
                         await bot.delete_message(
                             chat_id=message.chat.id,
@@ -654,6 +796,8 @@ async def process_url(message: Message, url: str):
                             user_id=user.id,
                             username=display_name,
                             url=url,
+                            video_source_id=video_source_id,
+                            direct_url=direct_url_to_save,
                         )
                     return  # Успешно отправили фото — выходим
 
@@ -661,8 +805,63 @@ async def process_url(message: Message, url: str):
                     logging.error(f"Failed to send TikTok photos: {photo_send_err}")
                     # Фото скачались но не отправились — продолжаем к видео
 
+            # --- TikTok ВИДЕО: прямое скачивание через tikwm (без yt-dlp!) ---
+            if content.content_type == "video" and content.video_url:
+                try:
+                    await _update_status(message.chat.id, status_msg_id, (
+                        "<h3>📥 Загрузка медиа</h3>\n"
+                        "<p>Статус: 🟡 <b>Скачивание видео (fast)...</b></p>\n"
+                        f"<p>Источник: <a href=\"{escaped_url}\">{domain}</a></p>"
+                    ))
+                except Exception:
+                    pass
+
+                direct_ok = await download_video_direct(content.video_url, output_path)
+                if direct_ok:
+                    # Видео скачано напрямую — отправляем
+                    shame_caption = _build_shame_caption()
+                    video = FSInputFile(output_path)
+                    await bot.edit_message_media(
+                        media=InputMediaVideo(
+                            media=video,
+                            caption=shame_caption,
+                            parse_mode="HTML" if shame_caption else None,
+                        ),
+                        chat_id=message.chat.id,
+                        message_id=status_msg_id,
+                    )
+                    sent_message_id = status_msg_id
+
+                    # Получаем telegram_file_id из обновлённого сообщения
+                    tg_file_id = None
+                    try:
+                        # Сообщение уже было edit_message_media → видео загружено
+                        # file_id можно получить из ответа, но edit_message_media
+                        # в aiogram не всегда возвращает обновлённое сообщение.
+                        # Пока оставляем None — заполним в будущем если понадобится.
+                        pass
+                    except Exception:
+                        pass
+
+                    if user:
+                        rec_id = add_video_record(
+                            chat_id=message.chat.id,
+                            user_id=user.id,
+                            username=display_name,
+                            url=url,
+                            video_source_id=video_source_id,
+                            direct_url=direct_url_to_save,
+                        )
+                        if rec_id > 0 and sent_message_id:
+                            update_bot_message_id(rec_id, sent_message_id, tg_file_id)
+                    return  # Успешно — выходим
+
+                else:
+                    logging.warning(f"Direct download failed for {url}, falling back to yt-dlp")
+                    # Падаем в yt-dlp ниже
+
         # ============================================================
-        #  Скачиваем видео (с retry-логикой для временных ошибок)
+        #  Скачиваем видео через yt-dlp (YouTube, Instagram, TikTok fallback)
         # ============================================================
         try:
             await _update_status(message.chat.id, status_msg_id, (
@@ -682,9 +881,14 @@ async def process_url(message: Message, url: str):
         actual_path = found_files[0] if found_files else output_path
 
         if os.path.exists(actual_path) and status_msg_id:
+            shame_caption = _build_shame_caption()
             video = FSInputFile(actual_path)
             await bot.edit_message_media(
-                media=InputMediaVideo(media=video),
+                media=InputMediaVideo(
+                    media=video,
+                    caption=shame_caption,
+                    parse_mode="HTML" if shame_caption else None,
+                ),
                 chat_id=message.chat.id,
                 message_id=status_msg_id,
             )
@@ -696,6 +900,8 @@ async def process_url(message: Message, url: str):
                     user_id=user.id,
                     username=display_name,
                     url=url,
+                    video_source_id=video_source_id,
+                    direct_url=direct_url_to_save,
                 )
                 if rec_id > 0 and sent_message_id:
                     update_bot_message_id(rec_id, sent_message_id)

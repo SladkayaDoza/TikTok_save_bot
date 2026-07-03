@@ -1,4 +1,5 @@
 import logging
+import sqlite3
 from datetime import datetime
 from sqlalchemy import (
     create_engine, Column, Integer, BigInteger, String, DateTime, func
@@ -21,6 +22,10 @@ class VideoRecord(Base):
     url = Column(String, nullable=False)
     bot_message_id = Column(BigInteger, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Deduplication & analytics fields
+    video_source_id = Column(String, nullable=True, index=True)   # "tiktok:7234567890"
+    direct_url = Column(String, nullable=True)                     # Прямая ссылка на медиа
+    telegram_file_id = Column(String, nullable=True, index=True)  # file_id от Telegram
 
 
 class ReactionRecord(Base):
@@ -34,13 +39,45 @@ class ReactionRecord(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+def _migrate_db():
+    """Add new columns to existing tables if they don't exist (safe upgrade)."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("PRAGMA table_info(videos)")
+    existing = {row[1] for row in cursor.fetchall()}
+
+    migrations = {
+        "video_source_id": "TEXT",
+        "direct_url": "TEXT",
+        "telegram_file_id": "TEXT",
+    }
+
+    for col, col_type in migrations.items():
+        if col not in existing:
+            cursor.execute(f"ALTER TABLE videos ADD COLUMN {col} {col_type}")
+            logging.info(f"Migration: added column '{col}' to videos table")
+
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS ix_videos_video_source_id ON videos (video_source_id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS ix_videos_telegram_file_id ON videos (telegram_file_id)"
+    )
+
+    conn.commit()
+    conn.close()
+
+
 def init_db():
     """Create all tables if they don't exist."""
     Base.metadata.create_all(engine)
+    _migrate_db()
     logging.info("Database initialized.")
 
 
-def add_video_record(chat_id: int, user_id: int, username: str, url: str) -> int:
+def add_video_record(chat_id: int, user_id: int, username: str, url: str,
+                     video_source_id: str = None, direct_url: str = None) -> int:
     """Add a video record and return its ID."""
     session = Session()
     try:
@@ -49,6 +86,8 @@ def add_video_record(chat_id: int, user_id: int, username: str, url: str) -> int
             user_id=user_id,
             username=username,
             url=url,
+            video_source_id=video_source_id,
+            direct_url=direct_url,
         )
         session.add(record)
         session.commit()
@@ -61,17 +100,48 @@ def add_video_record(chat_id: int, user_id: int, username: str, url: str) -> int
         session.close()
 
 
-def update_bot_message_id(record_id: int, bot_message_id: int):
-    """Update the bot_message_id after the video is sent."""
+def update_bot_message_id(record_id: int, bot_message_id: int,
+                          telegram_file_id: str = None):
+    """Update the bot_message_id (and optionally telegram_file_id) after the video is sent."""
     session = Session()
     try:
         record = session.query(VideoRecord).filter_by(id=record_id).first()
         if record:
             record.bot_message_id = bot_message_id
+            if telegram_file_id:
+                record.telegram_file_id = telegram_file_id
             session.commit()
     except Exception as e:
         session.rollback()
         logging.error(f"Failed to update bot_message_id: {e}")
+    finally:
+        session.close()
+
+
+def find_duplicate(chat_id: int, video_source_id: str) -> dict | None:
+    """Find the first record with this video_source_id in the chat.
+    Returns dict with user info and message link data, or None."""
+    if not video_source_id:
+        return None
+    session = Session()
+    try:
+        record = (
+            session.query(VideoRecord)
+            .filter_by(chat_id=chat_id, video_source_id=video_source_id)
+            .order_by(VideoRecord.created_at.asc())
+            .first()
+        )
+        if record:
+            return {
+                "user_id": record.user_id,
+                "username": record.username,
+                "bot_message_id": record.bot_message_id,
+                "url": record.url,
+            }
+        return None
+    except Exception as e:
+        logging.error(f"Failed to find duplicate: {e}")
+        return None
     finally:
         session.close()
 
