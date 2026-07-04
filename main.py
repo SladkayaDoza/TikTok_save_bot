@@ -587,6 +587,8 @@ async def cmd_disable(message: Message):
 def download_video(url: str, output_path: str, max_retries: int = 3):
     """Скачивает видео с retry-логикой для обхода временных ошибок TikTok."""
     import time
+    cookies_path = os.path.abspath("cookies.txt")
+    
     ydl_opts = {
         'outtmpl': output_path,
         # Более гибкий выбор формата с ограничением ~50МБ
@@ -602,6 +604,10 @@ def download_video(url: str, output_path: str, max_retries: int = 3):
             'preferedformat': 'mp4',
         }],
     }
+
+    # Подключаем куки, если файл существует (критично для Instagram)
+    if os.path.exists(cookies_path):
+        ydl_opts['cookiefile'] = cookies_path
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
