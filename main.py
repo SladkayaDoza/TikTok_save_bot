@@ -596,8 +596,13 @@ def download_video(url: str, output_path: str, max_retries: int = 3):
         'merge_output_format': 'mp4',
         'quiet': True,
         'no_warnings': True,
-        # Используем android клиент чтобы обойти JS-зависимости YouTube
-        'extractor_args': {'youtube': {'player_client': ['android_vr']}},
+        # YouTube требует JS-рантайм для решения n-challenge (иначе форматы
+        # отбрасываются и падаем в "Requested format is not available").
+        # По умолчанию yt-dlp ищет только deno — разрешаем ещё node/bun.
+        'js_runtimes': {'deno': {}, 'node': {}, 'bun': {}},
+        # android_vr не поддерживает cookies и молча пропускается, когда задан
+        # cookiefile, поэтому держим cookie-совместимые клиенты первыми.
+        'extractor_args': {'youtube': {'player_client': ['default', 'android_vr']}},
         # Конвертация в mp4 через ffmpeg если нужно
         'postprocessors': [{
             'key': 'FFmpegVideoConvertor',

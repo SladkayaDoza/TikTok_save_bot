@@ -181,6 +181,7 @@ cython_debug/
 .cursorindexingignore
 
 video_stats.db
+cookies.txt
 yt_test_stdout.txt
 yt_test_stderr.txt
 RICH_MESSAGES_GUIDE.md
