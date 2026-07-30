@@ -592,6 +592,7 @@ def download_video(url: str, output_path: str, max_retries: int = 3):
     ydl_opts = {
         'outtmpl': output_path,
         # Более гибкий выбор формата с ограничением ~50МБ
+        'max_filesize': 50 * 1024 * 1024,
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'merge_output_format': 'mp4',
         'quiet': True,
@@ -848,7 +849,7 @@ async def process_url(message: Message, url: str):
 
         await asyncio.wait_for(
             asyncio.to_thread(download_video, url, output_path),
-            timeout=120,
+            timeout=180,
         )
 
         found_files = glob.glob(os.path.join(TEMP_DIR, f"{video_id}*"))
