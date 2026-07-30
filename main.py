@@ -696,7 +696,7 @@ async def process_url(message: Message, url: str):
     def _build_shame_caption() -> str | None:
         if not is_duplicate or not duplicate_info:
             return None
-        parts = ["Аяйайай бака 🫵😹, видео других не смотрит а скинул повторчик)"]
+        parts = ["Аяйайай бака, скинул повторчик)"]
         dup_username = html.escape(duplicate_info["username"])
         msg_link = get_message_link(message.chat.id, duplicate_info.get("bot_message_id"))
         if msg_link:
