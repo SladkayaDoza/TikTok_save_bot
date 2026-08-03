@@ -189,3 +189,11 @@ iloveimg-compressed.zip
 APP_LOGIC.md
 active_groups.json
 media/
+
+# Песочница для экспериментов с эмбеддингами (медиа, JSON-эмбеддинги, кэш)
+sandbox/
+
+# Очередь на эмбеддинг: видео, ждущие фоновой обработки
+embed_queue/
+# Бэкапы базы, создаются автоматически перед миграцией
+video_stats.db.bak-*

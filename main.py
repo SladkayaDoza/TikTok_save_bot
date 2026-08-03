@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 import subprocess
 import requests as http_requests
 import aiohttp
-from openai import OpenAI
 from io import BytesIO
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -28,7 +27,10 @@ dotenv.load_dotenv()
 from database import (
     init_db, add_video_record, update_bot_message_id,
     sync_reactions, get_chat_stats, find_duplicate,
+    get_embedding_details, get_video_id_by_message, retry_failed_jobs,
 )
+import embedding
+import transcription
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -37,17 +39,16 @@ DATA_FILE = "active_groups.json"
 TEMP_DIR = "temporary_videos"
 MEDIA_DIR = "media"
 
-# --- DeepInfra Whisper ---
-DEEPINFRA_API_KEY = os.getenv("DEEPINFRA_API_KEY")  # Замените на ваш ключ DeepInfra
-whisper_client = OpenAI(
-    api_key=DEEPINFRA_API_KEY,
-    base_url="https://api.deepinfra.com/v1/openai",
-)
-# ---------------------
+# Распознавание речи живёт в transcription.py: провайдер (DeepInfra / OpenRouter /
+# выключено) выбирается там, клиент не создаётся на старте. Бот запускается
+# и работает даже без единого ключа — просто без этих функций.
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 active_groups = set()
+# Группы, где включён семантический поиск. Включается только админом,
+# отдельной командой на каждую группу.
+embedding_groups = set()
 
 # Global aiohttp session — reused across all raw API calls (avoids TCP/TLS overhead per request)
 _http_session: aiohttp.ClientSession | None = None
@@ -223,18 +224,32 @@ async def edit_rich_message(chat_id: int, message_id: int, html: str) -> dict:
         return {"ok": False, "description": str(e)}
 
 def load_data():
-    global active_groups
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                active_groups = set(json.load(f))
-        except Exception as e:
-            logging.error(f"Failed to load active groups: {e}")
+    global active_groups, embedding_groups
+    if not os.path.exists(DATA_FILE):
+        return
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, list):
+            # Старый формат — плоский список активных групп.
+            # Читаем как есть, при первом save_data() файл переедет на новый.
+            active_groups = set(data)
+            embedding_groups = set()
+            logging.info(f"Загружен старый формат {DATA_FILE}: {len(active_groups)} групп")
+        else:
+            active_groups = set(data.get("active_groups", []))
+            embedding_groups = set(data.get("embedding_groups", []))
+    except Exception as e:
+        logging.error(f"Failed to load active groups: {e}")
 
 def save_data():
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(active_groups), f)
+            json.dump({
+                "active_groups": list(active_groups),
+                "embedding_groups": list(embedding_groups),
+            }, f)
     except Exception as e:
         logging.error(f"Failed to save active groups: {e}")
 
@@ -355,21 +370,10 @@ def extract_audio_to_mp3(input_path: str, output_path: str) -> bool:
 
 
 def transcribe_audio(mp3_path: str) -> str | None:
-    """Отправляет mp3 файл в DeepInfra Whisper API (OpenAI SDK).
-    Возвращает текст транскрипции или None при ошибке."""
-    try:
-        with open(mp3_path, "rb") as f:
-            transcript = whisper_client.audio.transcriptions.create(
-                model="openai/whisper-large-v3",
-                file=f,
-                language="ru"
-            )
-        text = transcript.text.strip() if transcript.text else ""
-        return text if text else None
-
-    except Exception as e:
-        logging.error(f"Whisper API error: {e}")
-        return None
+    """Распознаёт речь через выбранного провайдера (см. transcription.py).
+    Возвращает текст или None, если речи нет либо провайдер недоступен."""
+    text, _cost = transcription.transcribe(mp3_path)
+    return text or None
 
 
 def get_media_from_message(message: Message) -> tuple[str, str] | None:
@@ -649,6 +653,47 @@ async def _update_status(chat_id: int, message_id: int, html_text: str):
         logging.error(f"Failed to update status message: {e}")
 
 
+def _extract_file_id(result) -> str | None:
+    """file_id из ответа edit_message_media.
+
+    Telegram возвращает обновлённое сообщение для не-inline правок. Сохранённый
+    file_id позволяет позже перекачать медиа из Telegram, не трогая исходную
+    ссылку — она к тому времени может умереть.
+    """
+    if not isinstance(result, Message):
+        return None
+    if result.video:
+        return result.video.file_id
+    if result.animation:
+        return result.animation.file_id
+    if result.photo:
+        return result.photo[-1].file_id
+    if result.document:
+        return result.document.file_id
+    return None
+
+
+async def _after_send(chat_id: int, rec_id: int, sent_message_id: int | None,
+                      media_path: str | None, kind: str = "video",
+                      tg_file_id: str | None = None):
+    """Общий хвост после успешной отправки медиа.
+
+    Вызывается ПОСЛЕ того, как видео уже улетело в чат, поэтому на скорость
+    доставки не влияет. Файл переносится в очередь и обрабатывается фоном.
+    """
+    if rec_id <= 0:
+        return
+
+    if sent_message_id:
+        update_bot_message_id(rec_id, sent_message_id, tg_file_id)
+
+    if chat_id in embedding_groups and media_path:
+        try:
+            await embedding.enqueue_media(rec_id, chat_id, media_path, kind)
+        except Exception as e:
+            logging.error(f"Не удалось поставить видео {rec_id} в очередь: {e}")
+
+
 async def process_url(message: Message, url: str):
     video_id = str(uuid.uuid4())
     output_path = os.path.join(TEMP_DIR, f"{video_id}.mp4")
@@ -736,9 +781,12 @@ async def process_url(message: Message, url: str):
                 photo_files = content.photo_paths
                 shame_caption = _build_shame_caption()
                 try:
+                    sent_message_id = None
+                    tg_file_id = None
+
                     if len(photo_files) == 1:
                         photo = FSInputFile(photo_files[0])
-                        await bot.edit_message_media(
+                        edited = await bot.edit_message_media(
                             media=InputMediaPhoto(
                                 media=photo,
                                 caption=shame_caption,
@@ -747,6 +795,8 @@ async def process_url(message: Message, url: str):
                             chat_id=message.chat.id,
                             message_id=status_msg_id,
                         )
+                        sent_message_id = status_msg_id
+                        tg_file_id = _extract_file_id(edited)
                     else:
                         media_group = [
                             InputMediaPhoto(media=FSInputFile(p))
@@ -759,20 +809,28 @@ async def process_url(message: Message, url: str):
                                 caption=shame_caption,
                                 parse_mode="HTML",
                             )
-                        await message.reply_media_group(media_group)
+                        sent_group = await message.reply_media_group(media_group)
+                        if sent_group:
+                            sent_message_id = sent_group[0].message_id
                         await bot.delete_message(
                             chat_id=message.chat.id,
                             message_id=status_msg_id,
                         )
 
                     if user:
-                        add_video_record(
+                        rec_id = add_video_record(
                             chat_id=message.chat.id,
                             user_id=user.id,
                             username=display_name,
                             url=url,
                             video_source_id=video_source_id,
                             direct_url=direct_url_to_save,
+                        )
+                        # Первое фото уходит в очередь: enqueue его перенесёт,
+                        # и finally ниже уже ничего не найдёт по этому пути.
+                        await _after_send(
+                            message.chat.id, rec_id, sent_message_id,
+                            photo_files[0], kind="image", tg_file_id=tg_file_id,
                         )
                     return  # Успешно отправили фото — выходим
 
@@ -796,7 +854,7 @@ async def process_url(message: Message, url: str):
                     # Видео скачано напрямую — отправляем
                     shame_caption = _build_shame_caption()
                     video = FSInputFile(output_path)
-                    await bot.edit_message_media(
+                    edited = await bot.edit_message_media(
                         media=InputMediaVideo(
                             media=video,
                             caption=shame_caption,
@@ -806,17 +864,7 @@ async def process_url(message: Message, url: str):
                         message_id=status_msg_id,
                     )
                     sent_message_id = status_msg_id
-
-                    # Получаем telegram_file_id из обновлённого сообщения
-                    tg_file_id = None
-                    try:
-                        # Сообщение уже было edit_message_media → видео загружено
-                        # file_id можно получить из ответа, но edit_message_media
-                        # в aiogram не всегда возвращает обновлённое сообщение.
-                        # Пока оставляем None — заполним в будущем если понадобится.
-                        pass
-                    except Exception:
-                        pass
+                    tg_file_id = _extract_file_id(edited)
 
                     if user:
                         rec_id = add_video_record(
@@ -827,8 +875,10 @@ async def process_url(message: Message, url: str):
                             video_source_id=video_source_id,
                             direct_url=direct_url_to_save,
                         )
-                        if rec_id > 0 and sent_message_id:
-                            update_bot_message_id(rec_id, sent_message_id, tg_file_id)
+                        await _after_send(
+                            message.chat.id, rec_id, sent_message_id,
+                            output_path, kind="video", tg_file_id=tg_file_id,
+                        )
                     return  # Успешно — выходим
 
                 else:
@@ -858,7 +908,7 @@ async def process_url(message: Message, url: str):
         if os.path.exists(actual_path) and status_msg_id:
             shame_caption = _build_shame_caption()
             video = FSInputFile(actual_path)
-            await bot.edit_message_media(
+            edited = await bot.edit_message_media(
                 media=InputMediaVideo(
                     media=video,
                     caption=shame_caption,
@@ -868,6 +918,7 @@ async def process_url(message: Message, url: str):
                 message_id=status_msg_id,
             )
             sent_message_id = status_msg_id
+            tg_file_id = _extract_file_id(edited)
 
             if user:
                 rec_id = add_video_record(
@@ -878,8 +929,10 @@ async def process_url(message: Message, url: str):
                     video_source_id=video_source_id,
                     direct_url=direct_url_to_save,
                 )
-                if rec_id > 0 and sent_message_id:
-                    update_bot_message_id(rec_id, sent_message_id)
+                await _after_send(
+                    message.chat.id, rec_id, sent_message_id,
+                    actual_path, kind="video", tg_file_id=tg_file_id,
+                )
         else:
             error_html = (
                 "<h3>❌ Ошибка загрузки</h3>\n"
@@ -951,6 +1004,20 @@ async def handle_meow_transcribe(message: Message):
     reply = message.reply_to_message
     if not reply:
         return  # Просто 'meow' без реплая — игнорируем
+
+    # Провайдер может быть не настроен — говорим об этом прямо, а не молчим
+    if not transcription.is_available():
+        reason = html.escape(transcription.unavailable_reason() or "")
+        hint = html.escape(transcription.setup_hint())
+        await send_rich_message(message.chat.id, (
+            "<h2>🎙️ Транскрипция аудио</h2>\n"
+            "<p>Статус: ⚙️ <b>Функция не настроена</b></p>\n"
+            "<hr/>\n"
+            f"<p>Причина: {reason}</p>\n"
+            f"<p>{hint}</p>\n"
+            "<p>После этого бота нужно перезапустить.</p>"
+        ), reply_to_message_id=message.message_id)
+        return
 
     # Извлекаем медиа из replied сообщения
     media_info = get_media_from_message(reply)
@@ -1188,6 +1255,308 @@ async def cmd_stats(message: Message):
     await send_rich_message(message.chat.id, stats_html, reply_to_message_id=message.message_id)
 
 
+# =====================================================================
+#  СЕМАНТИЧЕСКИЙ ПОИСК
+# =====================================================================
+
+def _embedding_disabled_html() -> str:
+    return (
+        "<h2>🔍 Поиск по видео</h2>\n"
+        "<p>В этом чате <b>семантический поиск не включён</b>.</p>\n"
+        "<hr/>\n"
+        "<p>Создатель бота может включить его командой <code>/embed_on</code>. "
+        "После этого в поиск будут попадать все новые видео — уже отправленные "
+        "ранее останутся неиндексированными.</p>"
+    )
+
+
+def _format_results(query_title: str, results: list[tuple[int, float]],
+                    chat_id: int) -> str:
+    """Собирает выдачу: процент, автор, ссылка на сообщение, кусок текста."""
+    details = get_embedding_details([vid for vid, _ in results])
+
+    items = []
+    for position, (video_id, score) in enumerate(results, 1):
+        info = details.get(video_id)
+        if not info:
+            continue
+
+        percent = round(score * 100)
+        author = html.escape(info.get("username") or "кто-то")
+        link = get_message_link(chat_id, info.get("bot_message_id"))
+
+        if link:
+            head = f'<b>{position}.</b> <a href="{link}">{percent}% — от {author}</a>'
+        else:
+            # Ссылку не построить (личка или потерянный message_id) — даём исходный URL
+            source = html.escape(info.get("url") or "")
+            head = (f'<b>{position}.</b> {percent}% — от {author} '
+                    f'(<a href="{source}">источник</a>)' if source
+                    else f'<b>{position}.</b> {percent}% — от {author}')
+
+        snippet = (info.get("visual_caption") or info.get("transcript") or "").strip()
+        snippet = re.sub(r"\s+", " ", snippet)
+        if len(snippet) > 160:
+            snippet = snippet[:160].rstrip() + "…"
+
+        items.append(f"<li>{head}<br/><i>{html.escape(snippet)}</i></li>"
+                     if snippet else f"<li>{head}</li>")
+
+    if not items:
+        return (
+            "<h2>🔍 Поиск по видео</h2>\n"
+            "<p>Ничего похожего не нашлось.</p>"
+        )
+
+    rows = "\n".join(items)
+    return (
+        f"<h2>🔍 {query_title}</h2>\n"
+        f"<ul>\n{rows}\n</ul>"
+    )
+
+
+@dp.message(Command("embed_on"))
+async def cmd_embed_on(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    if not embedding.is_configured():
+        reason = html.escape(embedding.unavailable_reason() or "неизвестная причина")
+        await send_rich_message(message.chat.id, (
+            "<h2>⚠️ Поиск недоступен</h2>\n"
+            f"<p>Причина: <b>{reason}</b></p>\n"
+            "<hr/>\n"
+            "<p>Что сделать:</p>\n"
+            "<ul>\n"
+            "  <li>Зависимости: <code>pip install -r requirements.txt</code></li>\n"
+            "  <li>Ключ: <a href=\"https://openrouter.ai/keys\">openrouter.ai/keys</a> "
+            "→ в <code>.env</code> как <code>OPENROUTER_API_KEY</code></li>\n"
+            "</ul>\n"
+            "<p>После этого перезапусти бота.</p>"
+        ), reply_to_message_id=message.message_id)
+        return
+
+    if message.chat.id in embedding_groups:
+        body = (
+            "<h2>🔍 Поиск по видео</h2>\n"
+            "<p>Уже <b>включён</b> в этом чате.</p>\n"
+            "<hr/>\n"
+            "<p>Состояние — <code>/embed_status</code>.</p>"
+        )
+    else:
+        embedding_groups.add(message.chat.id)
+        save_data()
+        body = (
+            "<h2>🔍 Поиск по видео</h2>\n"
+            "<p>Семантический поиск <b>включён</b>.</p>\n"
+            "<hr/>\n"
+            "<p>Новые видео после отправки в чат будут распознаваться и попадать "
+            "в индекс. На скорость скачивания это не влияет — обработка идёт фоном.</p>\n"
+            "<p>Ранее отправленные видео <b>не индексируются</b>.</p>\n"
+            "<ul>\n"
+            "  <li><code>/find текст</code> — найти видео по смыслу</li>\n"
+            "  <li><code>/similar</code> в ответ на видео — найти похожие</li>\n"
+            "  <li><code>/embed_status</code> — состояние и расход</li>\n"
+            "</ul>"
+        )
+    await send_rich_message(message.chat.id, body, reply_to_message_id=message.message_id)
+
+
+@dp.message(Command("embed_off"))
+async def cmd_embed_off(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    if message.chat.id in embedding_groups:
+        embedding_groups.discard(message.chat.id)
+        save_data()
+        body = (
+            "<h2>🔍 Поиск по видео</h2>\n"
+            "<p>Индексация <b>выключена</b>.</p>\n"
+            "<hr/>\n"
+            "<p>Новые видео в индекс больше не попадают. Уже построенный индекс "
+            "сохраняется — <code>/find</code> продолжит искать по нему.</p>"
+        )
+    else:
+        body = (
+            "<h2>🔍 Поиск по видео</h2>\n"
+            "<p>Индексация и так <b>не была включена</b> в этом чате.</p>"
+        )
+    await send_rich_message(message.chat.id, body, reply_to_message_id=message.message_id)
+
+
+@dp.message(Command("find"))
+async def cmd_find(message: Message):
+    if message.chat.id not in embedding_groups:
+        await send_rich_message(message.chat.id, _embedding_disabled_html(),
+                                reply_to_message_id=message.message_id)
+        return
+
+    query = re.sub(r"^/find(@\w+)?\s*", "", message.text or "", flags=re.IGNORECASE).strip()
+    if not query:
+        await send_rich_message(message.chat.id, (
+            "<h2>🔍 Поиск по видео</h2>\n"
+            "<p>Добавь текст запроса после команды.</p>\n"
+            "<hr/>\n"
+            "<p>Например: <code>/find кот играет на пианино</code></p>"
+        ), reply_to_message_id=message.message_id)
+        return
+
+    if embedding.index_size(message.chat.id) == 0:
+        await send_rich_message(message.chat.id, (
+            "<h2>🔍 Поиск по видео</h2>\n"
+            "<p>Индекс пока <b>пуст</b>.</p>\n"
+            "<hr/>\n"
+            "<p>Видео попадают в него после отправки в чат. Скинь пару роликов "
+            "и попробуй снова.</p>"
+        ), reply_to_message_id=message.message_id)
+        return
+
+    try:
+        results = await embedding.search_by_text(message.chat.id, query)
+    except Exception as e:
+        logging.error(f"Ошибка поиска: {e}")
+        await send_rich_message(message.chat.id, (
+            "<h2>🔍 Поиск по видео</h2>\n"
+            "<p>Не удалось выполнить поиск — сервис эмбеддингов недоступен.</p>\n"
+            "<hr/>\n"
+            f"<p>Детали: <code>{html.escape(str(e)[:120])}</code></p>"
+        ), reply_to_message_id=message.message_id)
+        return
+
+    title = f"Поиск: «{html.escape(query[:80])}»"
+    await send_rich_message(
+        message.chat.id,
+        _format_results(title, results, message.chat.id),
+        reply_to_message_id=message.message_id,
+    )
+
+
+@dp.message(Command("similar"))
+async def cmd_similar(message: Message):
+    if message.chat.id not in embedding_groups:
+        await send_rich_message(message.chat.id, _embedding_disabled_html(),
+                                reply_to_message_id=message.message_id)
+        return
+
+    reply = message.reply_to_message
+    if not reply:
+        await send_rich_message(message.chat.id, (
+            "<h2>🔍 Похожие видео</h2>\n"
+            "<p>Используй <code>/similar</code> в <b>ответ</b> на сообщение с видео от бота.</p>"
+        ), reply_to_message_id=message.message_id)
+        return
+
+    video_id = get_video_id_by_message(message.chat.id, reply.message_id)
+    if not video_id:
+        await send_rich_message(message.chat.id, (
+            "<h2>🔍 Похожие видео</h2>\n"
+            "<p>Это сообщение не найдено в базе — возможно, видео отправлено "
+            "до подключения бота.</p>"
+        ), reply_to_message_id=message.message_id)
+        return
+
+    results = await embedding.search_by_video(message.chat.id, video_id)
+    if results is None:
+        await send_rich_message(message.chat.id, (
+            "<h2>🔍 Похожие видео</h2>\n"
+            "<p>Это видео ещё не проиндексировано.</p>\n"
+            "<hr/>\n"
+            "<p>Либо обработка не завершилась, либо оно отправлено до включения "
+            "поиска. Состояние очереди — <code>/embed_status</code>.</p>"
+        ), reply_to_message_id=message.message_id)
+        return
+
+    await send_rich_message(
+        message.chat.id,
+        _format_results("Похожие видео", results, message.chat.id),
+        reply_to_message_id=message.message_id,
+    )
+
+
+@dp.message(Command("embed_status"))
+async def cmd_embed_status(message: Message):
+    report = embedding.status_report(message.chat.id)
+
+    enabled = message.chat.id in embedding_groups
+    total = report.get("total_videos", 0)
+    done = report.get("done", 0)
+    not_embedded = max(0, total - done)
+    percent = round(done / total * 100) if total else 0
+
+    limit = report.get("month_limit") or 0
+    spent = report.get("month_spend", 0.0)
+    left = report.get("month_left")
+
+    if limit > 0:
+        left_percent = round((left or 0) / limit * 100)
+        budget_row = (
+            f"<p>Лимит на месяц: <b>${spent:.2f}</b> из <b>${limit:.2f}</b> "
+            f"— осталось <b>${(left or 0):.2f}</b> ({left_percent}%)</p>"
+        )
+    else:
+        budget_row = f"<p>Потрачено за месяц: <b>${spent:.2f}</b> (лимит не задан)</p>"
+
+    queue_pending = report.get("pending", 0) + report.get("processing", 0)
+
+    body = (
+        "<h2>🔍 Состояние поиска</h2>\n"
+        f"<p>В этом чате: <b>{'включён' if enabled else 'выключен'}</b></p>\n"
+        + (f"<p>⚠️ Подсистема не работает: <b>"
+           f"{html.escape(report.get('unavailable_reason') or '')}</b></p>\n"
+           if not report.get("configured") else "")
+        +
+        "<hr/>\n"
+        "<table>\n"
+        "  <tr><th>Показатель</th><th>Значение</th></tr>\n"
+        f"  <tr><td>Всего видео в чате</td><td>{total}</td></tr>\n"
+        f"  <tr><td>Проиндексировано</td><td>{done} ({percent}%)</td></tr>\n"
+        f"  <tr><td>Без индекса</td><td>{not_embedded}</td></tr>\n"
+        f"  <tr><td>В очереди</td><td>{queue_pending}</td></tr>\n"
+        f"  <tr><td>Пропущено</td><td>{report.get('skipped', 0)}</td></tr>\n"
+        f"  <tr><td>Ошибок</td><td>{report.get('failed', 0)}</td></tr>\n"
+        "</table>\n"
+        "<hr/>\n"
+        f"{budget_row}\n"
+        f"<p>Файлов в очереди на диске: <b>{report.get('queue_mb', 0):.1f} МБ</b></p>\n"
+        "<details>\n"
+        "  <summary>Модели и настройки</summary>\n"
+        "  <ul>\n"
+        f"    <li>Эмбеддинги: <code>{report.get('embed_model')}</code></li>\n"
+        f"    <li>Распознавание речи: <code>{report.get('asr_model')}</code></li>\n"
+        f"    <li>Описание кадров: <code>{report.get('vlm_model')}</code> "
+        f"(режим: {report.get('vlm_policy')})</li>\n"
+        f"    <li>Порог автоподсказки «похоже»: {report.get('similar_threshold')}</li>\n"
+        "  </ul>\n"
+        "</details>"
+    )
+    await send_rich_message(message.chat.id, body, reply_to_message_id=message.message_id)
+
+
+@dp.message(Command("embed_retry"))
+async def cmd_embed_retry(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    count = retry_failed_jobs(message.chat.id)
+    embedding.wake_worker()
+
+    if count:
+        body = (
+            "<h2>🔁 Переиндексация</h2>\n"
+            f"<p>Возвращено в очередь: <b>{count}</b>.</p>\n"
+            "<hr/>\n"
+            "<p>Задачи, у которых не сохранился файл, повторить нельзя — "
+            "они останутся в ошибках.</p>"
+        )
+    else:
+        body = (
+            "<h2>🔁 Переиндексация</h2>\n"
+            "<p>Повторять нечего — упавших задач с сохранённым файлом нет.</p>"
+        )
+    await send_rich_message(message.chat.id, body, reply_to_message_id=message.message_id)
+
+
 @dp.message(F.text)
 async def handle_message(message: Message):
     # Если это группа, и она не инициализирована — игнорируем
@@ -1204,21 +1573,74 @@ async def handle_message(message: Message):
     for url in urls:
         asyncio.create_task(process_url(message, url))
 
+async def _handle_similar_found(chat_id: int, new_video_id: int,
+                                similar_video_id: int, score: float):
+    """Автоподсказка «похоже на это» при отправке нового видео.
+
+    Молчит, пока EMBED_SIMILAR_THRESHOLD не опустят ниже 1.0.
+    """
+    details = get_embedding_details([new_video_id, similar_video_id])
+    new_info = details.get(new_video_id)
+    old_info = details.get(similar_video_id)
+    if not new_info or not old_info:
+        return
+
+    link = get_message_link(chat_id, old_info.get("bot_message_id"))
+    if not link:
+        return
+
+    author = html.escape(old_info.get("username") or "кто-то")
+    body = (
+        f"<p>🤔 Похоже на <a href=\"{link}\">это видео от {author}</a> "
+        f"({round(score * 100)}%)</p>"
+    )
+    await send_rich_message(
+        chat_id, body,
+        reply_to_message_id=new_info.get("bot_message_id"),
+    )
+
+
 async def main():
     global _http_session
+    logging.basicConfig(level=logging.INFO)
     os.makedirs(TEMP_DIR, exist_ok=True)
     os.makedirs(MEDIA_DIR, exist_ok=True)
     load_data()
     init_db()
-    logging.basicConfig(level=logging.INFO)
+
+    # Поисковый индекс держим в памяти: пара тысяч векторов — единицы мегабайт
+    indexed = embedding.load_index()
+    logging.info(
+        f"Эмбеддинги: {indexed} векторов, "
+        f"включены в {len(embedding_groups)} чатах"
+    )
+
     # Pre-create the shared HTTP session so the first request doesn't pay the connection cost
     _http_session = aiohttp.ClientSession()
+
+    worker_task = None
+    if embedding.is_configured():
+        embedding.similar_callback = _handle_similar_found
+        worker_task = asyncio.create_task(embedding.worker(bot, ADMIN_ID))
+    elif embedding_groups:
+        logging.warning(
+            "Поиск включён в %s чатах, но не работает: %s. "
+            "Видео качаются и отправляются как обычно.",
+            len(embedding_groups), embedding.unavailable_reason(),
+        )
+
     print("Бот запущен!")
     try:
         # Запускаем polling, игнорируем накопившиеся апдейты
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot, allowed_updates=["message", "message_reaction"])
     finally:
+        if worker_task:
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
         if _http_session and not _http_session.closed:
             await _http_session.close()
 
