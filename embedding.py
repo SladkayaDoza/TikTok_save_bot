@@ -60,9 +60,15 @@ VLM_MODEL = os.getenv("VLM_MODEL", "google/gemini-3.5-flash-lite")
 VLM_FRAMES = int(os.getenv("VLM_FRAMES", "4"))
 FRAME_MAX_EDGE = 768
 
-# VLM зовём только когда речи нет (или транскрипт пустой) — экономит примерно
-# половину расхода, при этом немые мемы под музыку остаются в поиске.
-VLM_POLICY = os.getenv("VLM_POLICY", "no_speech")    # no_speech | always | never
+# 300 токенов не хватало на карточку из шести полей, а модели с обязательным
+# reasoning съедали лимит незаметно и отдавали текст, оборванный на полуслове.
+VLM_MAX_TOKENS = int(os.getenv("VLM_MAX_TOKENS", "2000"))
+_VLM_SEND_REASONING = os.getenv("VLM_REASONING", "1") not in ("0", "false", "no")
+
+# Описание кадров даёт больший прирост точности поиска, чем любой другой шаг,
+# поэтому по умолчанию считаем его для всех роликов. no_speech экономит около
+# половины расхода ценой примерно 15 п.п. recall@1.
+VLM_POLICY = os.getenv("VLM_POLICY", "always")       # always | no_speech | never
 
 MIN_SPEECH_SEC = 1.0
 
@@ -77,7 +83,17 @@ MONTHLY_LIMIT_USD = float(os.getenv("EMBED_MONTHLY_LIMIT_USD", "5.0"))
 SIMILAR_NOTIFY_THRESHOLD = float(os.getenv("EMBED_SIMILAR_THRESHOLD", "1.0"))
 
 FIND_TOP_N = 5
-FIND_MIN_SCORE = float(os.getenv("EMBED_FIND_MIN_SCORE", "0.35"))
+
+# Порог подобран замером на 327 запросах ПОСЛЕ снятия общей компоненты (см.
+# _postprocess): 0.20 глушит 9 бессмысленных запросов из 20 ценой 0.3%
+# правильных ответов. Честного «ничего не найдено» на этой шкале не существует —
+# классы правильных и мусорных ответов перекрываются, — так что это отсечка
+# заведомого мусора, а не гарантия.
+FIND_MIN_SCORE = float(os.getenv("EMBED_FIND_MIN_SCORE", "0.20"))
+
+# Константа модели для снятия общей (анизотропной) компоненты векторов.
+# Файл лежит рядом с этим модулем; без него поиск работает, но заметно хуже.
+MU_FILENAME = "isotropy_mu_768.npy"
 
 # Цена текстовых токенов gemini-embedding-2, $/токен — на случай, если
 # OpenRouter не вернул фактическую стоимость в usage.
@@ -239,12 +255,82 @@ def _l2_normalize(vec: np.ndarray) -> np.ndarray:
     return vec / norm if norm else vec
 
 
-def embed_text(text: str) -> tuple[np.ndarray, float]:
-    """Текст -> (нормализованный вектор float32, стоимость в USD)."""
+_MU = None
+_MU_CHECKED = False
+
+
+def _get_mu():
+    """Ленивая загрузка константы центрирования.
+
+    Именно ленивая и с мягким откатом: main.py импортирует этот модуль
+    безусловно, и np.load на уровне модуля уронил бы бота при отсутствии
+    numpy или файла — ровно то, от чего защищает мягкий импорт numpy выше.
+    """
+    global _MU, _MU_CHECKED
+    if _MU_CHECKED:
+        return _MU
+    _MU_CHECKED = True
+
+    if not _NUMPY_OK:
+        return None
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), MU_FILENAME)
+    try:
+        mu = np.load(path).astype(np.float32)
+    except Exception as e:
+        log.warning("Не удалось загрузить %s (%s). Поиск будет работать заметно "
+                    "хуже — верни файл из репозитория.", MU_FILENAME, e)
+        return None
+
+    if mu.ndim != 1 or mu.shape[0] != EMBED_DIM:
+        log.warning("%s рассчитан на другую размерность (%s против EMBED_DIM=%s) — "
+                    "центрирование отключено", MU_FILENAME, mu.shape, EMBED_DIM)
+        return None
+
+    _MU = mu
+    return _MU
+
+
+def _postprocess(vector: np.ndarray) -> np.ndarray:
+    """Нормализовать -> снять общую компоненту -> нормализовать снова.
+
+    Векторы gemini-embedding-2 анизотропны: у любых двух документов косинус
+    около 0.48 просто потому, что все они смотрят в одну сторону, и различать
+    приходится на третьем знаке. Вычитание средней компоненты возвращает
+    пространству разрешающую способность: несвязанные пары падают до ~0.24,
+    тематические поднимаются наверх. Стоит ноль вызовов API.
+
+    Применяется ОДИНАКОВО к документам и запросам — иначе они окажутся
+    в разных пространствах и поиск сломается.
+    """
+    vector = _l2_normalize(vector)
+    mu = _get_mu()
+    if mu is None:
+        return vector
+    return _l2_normalize(vector - mu)
+
+
+def vector_recipe() -> str:
+    """Как именно получен вектор — пишется в БД рядом с ним.
+
+    Векторы, посчитанные по разным рецептам, между собой несравнимы, поэтому
+    индекс обязан их различать: иначе поиск молча выдаёт мусор.
+    """
+    base = f"{EMBED_MODEL}@{EMBED_DIM}"
+    return f"{base}+mu1" if _get_mu() is not None else base
+
+
+def embed_texts(texts: list[str]) -> tuple[list[np.ndarray], float]:
+    """Список текстов -> (список векторов, суммарная стоимость).
+
+    OpenRouter принимает массив строк одним запросом, и батчевый вектор
+    побитово совпадает с одиночным — так что несколько текстов дешевле и
+    быстрее слать вместе, чем по одному.
+    """
     global _send_dimensions
 
-    text = (text or "").strip()
-    if not text:
+    cleaned = [(t or "").strip() for t in texts]
+    if not cleaned or any(not t for t in cleaned):
         raise ValueError("Пустой текст — нечего эмбеддить")
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY не задан")
@@ -253,7 +339,11 @@ def embed_text(text: str) -> tuple[np.ndarray, float]:
     last_error = None
 
     for attempt in range(4):
-        body = {"model": EMBED_MODEL, "input": text, "encoding_format": "float"}
+        body = {
+            "model": EMBED_MODEL,
+            "input": cleaned if len(cleaned) > 1 else cleaned[0],
+            "encoding_format": "float",
+        }
         if _send_dimensions:
             body["dimensions"] = EMBED_DIM
 
@@ -266,12 +356,21 @@ def embed_text(text: str) -> tuple[np.ndarray, float]:
 
         if response.status_code == 200:
             payload = response.json()
-            vector = np.asarray(payload["data"][0]["embedding"], dtype=np.float32)
+            # Порядок в ответе не гарантирован — раскладываем по полю index
+            items = sorted(payload["data"], key=lambda d: d.get("index", 0))
+            if len(items) != len(cleaned):
+                raise RuntimeError(
+                    f"OpenRouter вернул {len(items)} векторов на {len(cleaned)} текстов"
+                )
 
-            # gemini-embedding-2 обучен по Матрёшке — лишние измерения можно
-            # просто отрезать, но после этого вектор надо перенормировать.
-            if vector.shape[0] > EMBED_DIM:
-                vector = vector[:EMBED_DIM]
+            vectors = []
+            for item in items:
+                vector = np.asarray(item["embedding"], dtype=np.float32)
+                # gemini-embedding-2 обучен по Матрёшке — лишние измерения
+                # можно просто отрезать, вектор потом перенормируется.
+                if vector.shape[0] > EMBED_DIM:
+                    vector = vector[:EMBED_DIM]
+                vectors.append(_postprocess(vector))
 
             usage = payload.get("usage") or {}
             cost = float(usage.get("cost") or 0.0)
@@ -279,7 +378,7 @@ def embed_text(text: str) -> tuple[np.ndarray, float]:
                 tokens = int(usage.get("prompt_tokens") or usage.get("total_tokens") or 0)
                 cost = tokens * EMBED_PRICE_PER_TOKEN
 
-            return _l2_normalize(vector), cost
+            return vectors, cost
 
         if response.status_code == 400 and _send_dimensions:
             log.info("OpenRouter не принял dimensions — обрезаю вектор на своей стороне")
@@ -296,6 +395,12 @@ def embed_text(text: str) -> tuple[np.ndarray, float]:
     raise RuntimeError(f"OpenRouter embeddings недоступен: {last_error}")
 
 
+def embed_text(text: str) -> tuple[np.ndarray, float]:
+    """Один текст -> (вектор float32, стоимость в USD)."""
+    vectors, cost = embed_texts([text])
+    return vectors[0], cost
+
+
 def _sleep_backoff(attempt: int) -> None:
     import time
     time.sleep(2 ** attempt)
@@ -310,12 +415,41 @@ def transcribe(audio_path: str) -> tuple[str, float]:
     return transcription.transcribe(audio_path)
 
 
-_VLM_PROMPT = (
-    "Опиши, что происходит на этих кадрах из короткого видео, одним абзацем "
-    "на русском языке. Укажи: кто/что в кадре, действие, обстановку, настроение, "
-    "и обязательно перепиши весь текст, который видно на экране. "
-    "Без вступлений вроде «на изображении» — сразу по делу."
-)
+# Промпт подобран эмпирически: на независимом наборе запросов он даёт
+# +11 п.п. recall@1 против свободного описания абзацем. Ключевое — жёсткая
+# структура из шести полей и прямой запрет на описание обстановки: старый
+# промпт тратил половину ответа на стены, пол и «атмосферу», по которым
+# никто не ищет, и делал все описания похожими друг на друга.
+_VLM_PROMPT = """Это кадры короткого видео из чата с друзьями. Составь по ним поисковую карточку: по ней человек через месяц должен узнать ролик и найти его поиском.
+
+Ответь строго этими шестью строками, без вступлений и без пустой болтовни:
+
+Кто/что: люди, животные, предметы, персонажи — обычными словами, как назвал бы их обычный человек. Если у объекта есть и бытовое, и точное название, дай оба через запятую («велосипед, шоссейник»).
+Действие: что происходит в кадре. Одно предложение.
+Суть: о чём ролик, в чём шутка, новость или соль. Одно предложение.
+Текст на экране: дословно все надписи, подписи, титры, реплики, цифры и элементы интерфейса. Если надписей нет — напиши «нет».
+Названия: узнаваемые игры, фильмы, сериалы, соцсети, бренды, места, известные люди. Если ничего не узнаётся — «нет».
+Теги: 10-14 коротких поисковых слов через запятую, включая общую категорию (например: рыбалка, ремонт, кофе, путешествия, музыка, авто).
+
+Запрещено писать про: освещение, стены, пол, интерьер, качество съёмки, «атмосферу», «настроение», «создавая ощущение». Запрещены обороты «на кадрах», «на видео», «изображён», «запечатлён»."""
+
+# Поля карточки — по ним же проверяем, что ответ не оборвался на полуслове
+_CARD_FIELDS = ("Кто/что:", "Действие:", "Суть:", "Текст на экране:", "Названия:", "Теги:")
+
+
+def _caption_looks_truncated(text: str, finish_reason: str | None) -> bool:
+    """Оборвался ли ответ VLM.
+
+    Проверяем ровно то, что действительно сигнализирует об обрыве: явный
+    finish_reason='length' и отсутствие полей карточки. Признак usage.cost==0
+    для этого не годится — при недоступности API стоимость тоже нулевая,
+    и повтор ушёл бы в цикл на лежащем провайдере.
+    """
+    if finish_reason == "length":
+        return True
+    if not text:
+        return False
+    return sum(1 for field in _CARD_FIELDS if field in text) < 5
 
 
 def caption_frames(frames: list[str]) -> tuple[str, float]:
@@ -338,33 +472,64 @@ def caption_frames(frames: list[str]) -> tuple[str, float]:
     if len(content) == 1:
         return "", 0.0
 
-    try:
-        response = requests.post(
-            f"{OPENROUTER_BASE_URL}/chat/completions",
-            headers=_headers(),
-            json={
-                "model": VLM_MODEL,
-                "messages": [{"role": "user", "content": content}],
-                "max_tokens": 300,
-                "temperature": 0.2,
-                "usage": {"include": True},
-            },
-            timeout=180,
-        )
-    except requests.RequestException as e:
-        log.warning("VLM недоступна: %s", e)
-        return "", 0.0
+    total_cost = 0.0
+    send_reasoning = _VLM_SEND_REASONING
 
-    if response.status_code != 200:
-        log.warning("VLM HTTP %s: %s", response.status_code, response.text[:200])
-        return "", 0.0
+    # Максимум одна повторная попытка: обрыв ответа бывает, но зацикливаться
+    # на недоступном провайдере нельзя — воркер один и очередь встанет.
+    for attempt in range(2):
+        body = {
+            "model": VLM_MODEL,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": VLM_MAX_TOKENS,
+            "temperature": 0.2,
+            "usage": {"include": True},
+        }
+        if send_reasoning:
+            # Некоторые модели (gemini-3.5-flash-lite) рассуждают всегда и
+            # съедают лимит токенов молча. Просим минимум и не возвращать его.
+            body["reasoning"] = {"effort": "low", "exclude": True}
 
-    payload = response.json()
-    cost = float((payload.get("usage") or {}).get("cost") or 0.0)
-    try:
-        return (payload["choices"][0]["message"]["content"] or "").strip(), cost
-    except (KeyError, IndexError):
-        return "", cost
+        try:
+            response = requests.post(
+                f"{OPENROUTER_BASE_URL}/chat/completions",
+                headers=_headers(), json=body, timeout=180,
+            )
+        except requests.RequestException as e:
+            log.warning("VLM недоступна: %s", e)
+            return "", total_cost
+
+        if response.status_code == 400 and send_reasoning:
+            # Модель не принимает поле reasoning — повторяем без него
+            log.info("VLM не поддерживает reasoning, повторяю без него")
+            send_reasoning = False
+            continue
+
+        if response.status_code != 200:
+            log.warning("VLM HTTP %s: %s", response.status_code, response.text[:200])
+            return "", total_cost
+
+        payload = response.json()
+        total_cost += float((payload.get("usage") or {}).get("cost") or 0.0)
+
+        try:
+            choice = payload["choices"][0]
+            text = (choice["message"]["content"] or "").strip()
+            finish = choice.get("finish_reason")
+        except (KeyError, IndexError):
+            return "", total_cost
+
+        if not _caption_looks_truncated(text, finish):
+            return text, total_cost
+
+        if attempt == 0:
+            log.info("Описание оборвано (finish_reason=%s, %s симв.) — переспрашиваю",
+                     finish, len(text))
+        else:
+            log.warning("Описание оборвано повторно, беру как есть")
+            return text, total_cost
+
+    return "", total_cost
 
 
 # =====================================================================
@@ -399,9 +564,17 @@ def load_index() -> int:
         return 0
 
     rows = load_embeddings()
+    current = vector_recipe()
 
     buckets: dict[int, list] = {}
+    stale = 0
     for row in rows:
+        # Векторы, посчитанные по другому рецепту (иная модель, размерность
+        # или отсутствие центрирования), лежат в другом пространстве. Считать
+        # по ним косинус — молча выдавать мусор, поэтому пропускаем.
+        if (row.get("recipe") or "") != current:
+            stale += 1
+            continue
         try:
             vector = np.frombuffer(row["embedding"], dtype=np.float32)
         except Exception:
@@ -409,6 +582,13 @@ def load_index() -> int:
         if vector.size == 0:
             continue
         buckets.setdefault(row["chat_id"], []).append((row["video_id"], vector))
+
+    if stale:
+        log.warning(
+            "Пропущено %s векторов с устаревшим рецептом (текущий: %s). "
+            "Эти ролики не будут находиться, пока их не переиндексировать.",
+            stale, current,
+        )
 
     total = 0
     for chat_id, items in buckets.items():
@@ -764,6 +944,7 @@ async def worker(bot, admin_id: int) -> None:
                 job["id"], result["transcript"], result["caption"],
                 result["doc_text"], vector.astype(np.float32).tobytes(),
                 int(vector.shape[0]), EMBED_MODEL, result["cost"],
+                vector_recipe(),
             )
             index_add(job["chat_id"], job["video_id"], vector)
             _cleanup(job["media_path"])
@@ -809,6 +990,8 @@ def status_report(chat_id: int) -> dict:
         "index_size": index_size(chat_id),
         "queue_mb": _queue_size_mb(),
         "embed_model": EMBED_MODEL,
+        "vector_recipe": vector_recipe(),
+        "centering": _get_mu() is not None,
         "asr_model": (f"{transcription.ASR_MODEL} ({transcription.provider_title()})"
                       if transcription.is_available() else "не настроено"),
         "vlm_model": VLM_MODEL if VLM_POLICY != "never" else "выключена",

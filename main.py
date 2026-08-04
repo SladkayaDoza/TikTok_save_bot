@@ -1523,6 +1523,8 @@ async def cmd_embed_status(message: Message):
         "  <summary>Модели и настройки</summary>\n"
         "  <ul>\n"
         f"    <li>Эмбеддинги: <code>{report.get('embed_model')}</code></li>\n"
+        f"    <li>Центрирование векторов: "
+        f"{'включено' if report.get('centering') else '<b>ВЫКЛЮЧЕНО</b> (нет файла константы!)'}</li>\n"
         f"    <li>Распознавание речи: <code>{report.get('asr_model')}</code></li>\n"
         f"    <li>Описание кадров: <code>{report.get('vlm_model')}</code> "
         f"(режим: {report.get('vlm_policy')})</li>\n"

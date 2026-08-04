@@ -66,6 +66,10 @@ class VideoEmbedding(Base):
     embedding = Column(LargeBinary, nullable=True)   # float32.tobytes()
     embedding_dim = Column(Integer, nullable=True)
     embed_model = Column(String, nullable=True)
+    # Как получен вектор: модель, размерность и постобработка
+    # ("google/gemini-embedding-2@768+mu1"). Векторы с разными рецептами
+    # несравнимы, поэтому индекс грузит только совпадающие с текущим.
+    vector_recipe = Column(String, nullable=True, index=True)
 
     attempts = Column(Integer, nullable=False, default=0)
     error = Column(Text, nullable=True)
@@ -132,7 +136,15 @@ def _migrate_db():
     # Эмбеддинги: таблицу создаёт create_all(), здесь только составной индекс
     # под основной запрос воркера (очередь) и под загрузку индекса по чату.
     cursor.execute("PRAGMA table_info(video_embeddings)")
-    if cursor.fetchall():
+    vemb_cols = {row[1] for row in cursor.fetchall()}
+    if vemb_cols:
+        if "vector_recipe" not in vemb_cols:
+            cursor.execute("ALTER TABLE video_embeddings ADD COLUMN vector_recipe TEXT")
+            logging.info("Migration: added column 'vector_recipe' to video_embeddings")
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_vemb_recipe "
+            "ON video_embeddings (chat_id, vector_recipe)"
+        )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS ix_vemb_status_created "
             "ON video_embeddings (status, created_at)"
@@ -404,7 +416,8 @@ def next_pending_job() -> dict | None:
 
 def save_embedding_result(job_id: int, transcript: str, visual_caption: str,
                           doc_text: str, embedding: bytes, dim: int,
-                          model: str, cost_usd: float) -> None:
+                          model: str, cost_usd: float,
+                          vector_recipe: str = None) -> None:
     session = Session()
     try:
         job = session.query(VideoEmbedding).filter_by(id=job_id).first()
@@ -417,6 +430,7 @@ def save_embedding_result(job_id: int, transcript: str, visual_caption: str,
         job.embedding = embedding
         job.embedding_dim = dim
         job.embed_model = model
+        job.vector_recipe = vector_recipe
         job.cost_usd = (job.cost_usd or 0.0) + (cost_usd or 0.0)
         job.media_path = None
         job.error = None
@@ -486,6 +500,7 @@ def load_embeddings(chat_id: int = None) -> list[dict]:
             VideoEmbedding.chat_id,
             VideoEmbedding.embedding,
             VideoEmbedding.embedding_dim,
+            VideoEmbedding.vector_recipe,
         ).filter(VideoEmbedding.status == "done", VideoEmbedding.embedding.isnot(None))
 
         if chat_id is not None:
@@ -497,6 +512,7 @@ def load_embeddings(chat_id: int = None) -> list[dict]:
                 "chat_id": row.chat_id,
                 "embedding": row.embedding,
                 "dim": row.embedding_dim,
+                "recipe": row.vector_recipe,
             }
             for row in query.all()
         ]
