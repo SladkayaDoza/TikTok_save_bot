@@ -2,7 +2,7 @@ import logging
 import os
 import shutil
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import (
     create_engine, Column, Integer, BigInteger, String, DateTime, Float,
     LargeBinary, Text, func
@@ -133,6 +133,13 @@ def _migrate_db():
         "CREATE INDEX IF NOT EXISTS ix_videos_telegram_file_id ON videos (telegram_file_id)"
     )
 
+    # Реакции обновляются по одному пользователю за раз — под этот запрос
+    # нужен составной индекс, иначе на каждой реакции идёт скан таблицы.
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS ix_reactions_msg_user "
+        "ON reactions (chat_id, message_id, user_id)"
+    )
+
     # Эмбеддинги: таблицу создаёт create_all(), здесь только составной индекс
     # под основной запрос воркера (очередь) и под загрузку индекса по чату.
     cursor.execute("PRAGMA table_info(video_embeddings)")
@@ -236,30 +243,42 @@ def find_duplicate(chat_id: int, video_source_id: str) -> dict | None:
         session.close()
 
 
-def sync_reactions(chat_id: int, message_id: int, reactions: list[dict]):
-    """
-    Sync reactions for a bot message.
-    reactions: list of {"user_id": int, "emoji": str}
+def sync_user_reactions(chat_id: int, message_id: int, user_id: int,
+                        emojis: list[str], reacted_at: datetime = None):
+    """Обновить реакции ОДНОГО пользователя на одном сообщении.
+
+    Telegram присылает MessageReactionUpdated отдельно на каждого человека:
+    в событии лежит только его личный набор реакций. Поэтому трогать здесь
+    можно исключительно его строки — иначе реакция одного стирает реакции
+    всех остальных.
+
+    Пустой emojis — это штатная ситуация: человек снял реакцию. Его строки
+    надо удалить и ничего не вставлять.
     """
     session = Session()
     try:
-        # Delete old reactions for this message
         session.query(ReactionRecord).filter_by(
-            chat_id=chat_id, message_id=message_id
+            chat_id=chat_id, message_id=message_id, user_id=user_id
         ).delete()
 
-        # Insert new reactions
-        for r in reactions:
+        # Telegram отдаёт время с таймзоной, остальная база живёт в наивном
+        # UTC. Без приведения сравнения дат молча ломаются.
+        stamp = reacted_at or datetime.utcnow()
+        if stamp.tzinfo is not None:
+            stamp = stamp.astimezone(timezone.utc).replace(tzinfo=None)
+
+        for emoji in emojis:
             session.add(ReactionRecord(
                 chat_id=chat_id,
                 message_id=message_id,
-                user_id=r["user_id"],
-                emoji=r["emoji"],
+                user_id=user_id,
+                emoji=emoji,
+                created_at=stamp,
             ))
         session.commit()
     except Exception as e:
         session.rollback()
-        logging.error(f"Failed to sync reactions: {e}")
+        logging.error(f"Failed to sync reactions for user {user_id}: {e}")
     finally:
         session.close()
 

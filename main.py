@@ -26,7 +26,7 @@ dotenv.load_dotenv()
 
 from database import (
     init_db, add_video_record, update_bot_message_id,
-    sync_reactions, get_chat_stats, find_duplicate,
+    sync_user_reactions, get_chat_stats, find_duplicate,
     get_embedding_details, get_video_id_by_message, retry_failed_jobs,
 )
 import embedding
@@ -1169,24 +1169,37 @@ async def handle_meow_transcribe(message: Message):
 # --- Обработчик реакций ---
 @dp.message_reaction()
 async def handle_reaction(event: MessageReactionUpdated):
-    """Track reactions added/removed on bot messages."""
-    chat_id = event.chat.id
-    message_id = event.message_id
+    """Реакции на сообщения бота.
 
-    new_reactions = []
+    Событие приходит на ОДНОГО человека и содержит его полный набор реакций
+    на это сообщение. Пустой набор — штатная ситуация: реакцию сняли.
+    Поэтому обновляем строго строки этого пользователя и никого больше.
+    """
+    # Аноним («от имени чата») приходит без user — берём actor_chat.
+    # Если нет ни того, ни другого, привязать реакцию не к кому.
+    actor = event.user or event.actor_chat
+    if actor is None:
+        return
+
+    emojis = []
     for reaction in (event.new_reaction or []):
-        emoji = None
-        if hasattr(reaction, "emoji"):
-            emoji = reaction.emoji
-        elif hasattr(reaction, "custom_emoji_id"):
-            emoji = f"custom:{reaction.custom_emoji_id}"
+        emoji = getattr(reaction, "emoji", None)
         if emoji:
-            new_reactions.append({
-                "user_id": event.user.id if event.user else 0,
-                "emoji": emoji,
-            })
+            emojis.append(emoji)
+            continue
+        custom = getattr(reaction, "custom_emoji_id", None)
+        if custom:
+            emojis.append(f"custom:{custom}")
+            continue
+        # Платные звёзды и любые будущие типы: факт реакции сохраняем,
+        # даже если конкретное изображение нам неизвестно
+        kind = getattr(reaction, "type", None)
+        if kind:
+            emojis.append(f"type:{kind}")
 
-    sync_reactions(chat_id, message_id, new_reactions)
+    sync_user_reactions(
+        event.chat.id, event.message_id, actor.id, emojis, event.date,
+    )
 
 
 # --- Команда /stats ---
