@@ -580,6 +580,59 @@ def get_embedding_details(video_ids: list[int]) -> dict[int, dict]:
         session.close()
 
 
+def get_video_record_by_message(chat_id: int, bot_message_id: int) -> dict | None:
+    """Запись о видео по сообщению бота (вместе со статусом индексации) — для /info."""
+    session = Session()
+    try:
+        row = (
+            session.query(VideoRecord, VideoEmbedding)
+            .outerjoin(VideoEmbedding, VideoEmbedding.video_id == VideoRecord.id)
+            .filter(
+                VideoRecord.chat_id == chat_id,
+                VideoRecord.bot_message_id == bot_message_id,
+            )
+            .first()
+        )
+        if not row:
+            return None
+        record, job = row
+        return {
+            "id": record.id,
+            "url": record.url,
+            "video_source_id": record.video_source_id,
+            "direct_url": record.direct_url,
+            "username": record.username,
+            "created_at": record.created_at,
+            "embed_status": job.status if job else None,
+            "transcript": job.transcript if job else None,
+            "visual_caption": job.visual_caption if job else None,
+        }
+    except Exception as e:
+        logging.error(f"Failed to get video record by message: {e}")
+        return None
+    finally:
+        session.close()
+
+
+def get_message_reaction_count(chat_id: int, message_id: int) -> int:
+    """Сколько реакций собрало конкретное сообщение бота."""
+    session = Session()
+    try:
+        return (
+            session.query(func.count(ReactionRecord.id))
+            .filter(
+                ReactionRecord.chat_id == chat_id,
+                ReactionRecord.message_id == message_id,
+            )
+            .scalar() or 0
+        )
+    except Exception as e:
+        logging.error(f"Failed to count reactions for message {message_id}: {e}")
+        return 0
+    finally:
+        session.close()
+
+
 def get_video_id_by_message(chat_id: int, bot_message_id: int) -> int | None:
     """video_id по сообщению бота — для /similar в ответ на видео."""
     session = Session()

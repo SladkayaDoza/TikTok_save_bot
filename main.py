@@ -8,6 +8,7 @@ import html
 import re
 import json
 import uuid
+from datetime import datetime
 from dataclasses import dataclass, field
 import subprocess
 import requests as http_requests
@@ -28,6 +29,7 @@ from database import (
     init_db, add_video_record, update_bot_message_id,
     sync_user_reactions, get_chat_stats, find_duplicate,
     get_embedding_details, get_video_id_by_message, retry_failed_jobs,
+    get_video_record_by_message, get_message_reaction_count,
 )
 import embedding
 import transcription
@@ -112,6 +114,8 @@ def to_fallback_html(html: str) -> str:
     # p -> newlines
     res = re.sub(r'<p[^>]*>', '', res)
     res = re.sub(r'</p>', '\n', res)
+    # br -> newline
+    res = re.sub(r'<br\s*/?>', '\n', res)
     # h1-h6 -> bold with newlines
     res = re.sub(r'<h[1-6][^>]*>', '\n<b>', res)
     res = re.sub(r'</h[1-6]>', '</b>\n', res)
@@ -1266,6 +1270,142 @@ async def cmd_stats(message: Message):
     )
 
     await send_rich_message(message.chat.id, stats_html, reply_to_message_id=message.message_id)
+
+
+# =====================================================================
+#  INFO — КАРТОЧКА ВИДЕО ИЗ БД В ОТВЕТ НА СООБЩЕНИЕ
+# =====================================================================
+
+def _human_when(dt) -> str | None:
+    """Дату из БД в человеческий вид: «только что», «25 мин назад», «вчера, 18:04»."""
+    if not dt:
+        return None
+    now = datetime.utcnow()
+    delta = now - dt
+    minutes = delta.total_seconds() / 60
+    if minutes < 1:
+        return "только что"
+    if minutes < 60:
+        n = int(minutes)
+        return f"{n} мин назад"
+    hours = minutes / 60
+    if hours < 24:
+        n = int(hours)
+        return f"{n} ч назад"
+    if delta.days == 1:
+        return f"вчера, {dt.strftime('%H:%M')}"
+    if delta.days < 30:
+        return f"{delta.days} дн назад"
+    return dt.strftime("%d.%m.%Y")
+
+
+# Человеческие названия платформ по префиксу video_source_id
+_PLATFORM_NAMES = {
+    "tiktok": "TikTok",
+    "youtube": "YouTube",
+    "instagram": "Instagram",
+}
+
+# Человеческие названия статусов индексации
+_EMBED_STATUS = {
+    "done": "✅ Готово",
+    "pending": "⏳ В очереди",
+    "processing": "🔄 Обрабатывается",
+    "failed": "❌ Ошибка",
+    "skipped": "⏭ Пропущено",
+}
+
+
+@dp.message(Command("info"))
+async def cmd_info(message: Message):
+    """Карточка видео из базы: кто и когда скинул, реакции, статус индексации и описание."""
+    reply = message.reply_to_message
+    if not reply:
+        await send_rich_message(message.chat.id, (
+            "<h2>🎬 Информация о видео</h2>\n"
+            "<p>Используй <code>/info</code> в <b>ответ</b> на видео, отправленное ботом.</p>"
+        ), reply_to_message_id=message.message_id)
+        return
+
+    record = get_video_record_by_message(message.chat.id, reply.message_id)
+    if not record:
+        await send_rich_message(message.chat.id, (
+            "<h2>🎬 Информация о видео</h2>\n"
+            "<p>Это сообщение не найдено в базе — возможно, видео отправлено "
+            "до подключения бота.</p>"
+        ), reply_to_message_id=message.message_id)
+        return
+
+    # Платформа: из video_source_id, иначе по домену ссылки
+    source_id = record.get("video_source_id") or ""
+    platform = _PLATFORM_NAMES.get(source_id.split(":")[0]) or get_domain_name(record.get("url") or "")
+
+    reactions = get_message_reaction_count(message.chat.id, reply.message_id)
+    embed_status = _EMBED_STATUS.get(record.get("embed_status")) or "— не индексировалось"
+
+    rows = [
+        ("📺 Источник", f"<b>{platform}</b>"),
+        ("👤 Отправил", f"<b>{html.escape(record.get('username') or 'кто-то')}</b>"),
+        ("📅 Когда", f"<b>{_human_when(record.get('created_at')) or 'неизвестно'}</b>"),
+        ("❤️ Реакций", f"<b>{reactions}</b>"),
+        ("🧠 Индексация", f"<b>{embed_status}</b>"),
+    ]
+    rows_str = "\n".join(
+        f"  <tr>\n    <td>{label}</td>\n    <td>{value}</td>\n  </tr>"
+        for label, value in rows
+    )
+
+    card_html = (
+        "<h2>🎬 Информация о видео</h2>\n"
+        "<table>\n"
+        f"{rows_str}\n"
+        "</table>"
+    )
+
+    # Описание — то, что бот распознал из видео (описание кадров / транскрипт)
+    visual_caption = (record.get("visual_caption") or "").strip()
+    transcript = (record.get("transcript") or "").strip()
+
+    if visual_caption or transcript:
+        card_html += "\n<hr/>"
+        if visual_caption:
+            escaped_desc = html.escape(visual_caption[:2500])
+            if len(visual_caption) > 2500:
+                escaped_desc += "…"
+            card_html += (
+                "\n<details>\n"
+                "  <summary>Описание</summary>\n"
+                f"  <p>{escaped_desc.replace(chr(10), '<br/>')}</p>\n"
+                "</details>"
+            )
+        if transcript:
+            escaped_text = html.escape(transcript[:2500])
+            if len(transcript) > 2500:
+                escaped_text += "…"
+            card_html += (
+                "\n<details>\n"
+                "  <summary>Транскрипция</summary>\n"
+                f"  <p>{escaped_text.replace(chr(10), '<br/>')}</p>\n"
+                "</details>"
+            )
+    else:
+        card_html += (
+            "\n<hr/>\n"
+            "<p><i>Описание недоступно — видео ещё не проиндексировано "
+            "или семантический поиск выключен.</i></p>"
+        )
+
+    # Ссылка на источник — в сворачиваемом блоке, чтобы не мусорить в карточке
+    url = record.get("url")
+    if url:
+        card_html += (
+            "\n<details>\n"
+            "  <summary>Ссылка на источник</summary>\n"
+            f"  <p><a href=\"{html.escape(url)}\">{html.escape(url)}</a></p>\n"
+            "</details>"
+        )
+
+    await send_rich_message(message.chat.id, card_html, reply_to_message_id=message.message_id)
 
 
 # =====================================================================
