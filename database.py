@@ -222,11 +222,16 @@ def find_duplicate(chat_id: int, video_source_id: str) -> dict | None:
         return None
     session = Session()
     try:
-        record = (
+        base = (
             session.query(VideoRecord)
             .filter_by(chat_id=chat_id, video_source_id=video_source_id)
-            .order_by(VideoRecord.created_at.asc())
-            .first()
+            .order_by(VideoRecord.created_at.asc(), VideoRecord.id.asc())
+        )
+        # Первое видео, на которое можно сослаться (сообщение бота известно);
+        # если таких нет — просто самая ранняя запись
+        record = (
+            base.filter(VideoRecord.bot_message_id.isnot(None)).first()
+            or base.first()
         )
         if record:
             return {
@@ -234,6 +239,7 @@ def find_duplicate(chat_id: int, video_source_id: str) -> dict | None:
                 "username": record.username,
                 "bot_message_id": record.bot_message_id,
                 "url": record.url,
+                "created_at": record.created_at,
             }
         return None
     except Exception as e:

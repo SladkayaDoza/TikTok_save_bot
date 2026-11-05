@@ -257,14 +257,25 @@ def save_data():
     except Exception as e:
         logging.error(f"Failed to save active groups: {e}")
 
-# Регулярное выражение для поиска ссылок YouTube (в т.ч. Shorts), TikTok и Instagram
+# Регулярное выражение для поиска ссылок YouTube (в т.ч. Shorts), TikTok, Instagram и X (Twitter)
 URL_REGEX = re.compile(
-    r'(https?://(?:www\.)?(?:youtube\.com|youtu\.be|tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com|instagram\.com)[^\s]+)'
+    r'(https?://(?:www\.)?(?:'
+    r'(?:youtube\.com|youtu\.be|tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com|instagram\.com)[^\s]+'
+    r'|(?:mobile\.)?(?:x|twitter)\.com/[^\s]+'
+    r'))'
 )
 
 TIKTOK_URL_REGEX = re.compile(
     r'https?://(?:www\.)?(?:tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com)'
 )
+
+# Твит: x.com/<user>/status/<id> (или /i/status/<id>), а также twitter.com
+TWITTER_STATUS_REGEX = re.compile(
+    r'https?://(?:www\.|mobile\.)?(?:x|twitter)\.com/(?:[^/\s]+/)?status(?:es)?/(\d+)'
+)
+
+# Лимит Bot API на загрузку файла — 50 МБ, оставляем запас
+MAX_UPLOAD_BYTES = 45 * 1024 * 1024
 
 
 # =====================================================================
@@ -301,18 +312,29 @@ def extract_video_source_id(url: str) -> str | None:
     if m:
         return f"instagram:{m.group(1)}"
 
+    # X / Twitter: /status/1234567890 — один и тот же твит на x.com и twitter.com
+    m = TWITTER_STATUS_REGEX.search(url)
+    if m:
+        return f"twitter:{m.group(1)}"
+
     return None
 
 
-def get_message_link(chat_id: int, message_id: int) -> str | None:
-    """Constructs a Telegram deep link to a specific message in a supergroup."""
+def get_message_link(chat_id: int, message_id: int,
+                     chat_username: str | None = None) -> str | None:
+    """Constructs a Telegram deep link to a specific message in a group.
+
+    Публичная группа (есть username) — t.me/<username>/<id>, работает для всех.
+    Приватная супергруппа — t.me/c/<id>/<msg>, работает для участников.
+    Обычная (не супер-) группа ссылок на сообщения не поддерживает.
+    """
     if not message_id:
         return None
-    if chat_id < 0:
+    if chat_username:
+        return f"https://t.me/{chat_username}/{message_id}"
+    if chat_id < 0 and str(chat_id).startswith("-100"):
         # Supergroup: chat_id is -100XXXXXXXXXX → need XXXXXXXXXX
-        clean_id = str(abs(chat_id))
-        if clean_id.startswith("100"):
-            clean_id = clean_id[3:]
+        clean_id = str(abs(chat_id))[3:]
         return f"https://t.me/c/{clean_id}/{message_id}"
     return None
 
@@ -546,6 +568,81 @@ async def analyze_tiktok_content(url: str) -> TikTokContent:
     return result
 
 
+def _pick_twitter_mp4(video: dict) -> str | None:
+    """Лучшее mp4 из вариантов твита, которое влезает в лимит Telegram."""
+    duration = float(video.get("duration") or 0)
+    mp4s = [
+        f for f in (video.get("formats") or video.get("variants") or [])
+        if isinstance(f, dict) and f.get("url")
+        and (f.get("container") == "mp4" or ".mp4" in f["url"])
+    ]
+    if not mp4s:
+        url = video.get("url")
+        return url if url and ".mp4" in url else None
+
+    mp4s.sort(key=lambda f: f.get("bitrate") or 0, reverse=True)
+    if duration > 0:
+        for f in mp4s:
+            est_bytes = (f.get("bitrate") or 0) / 8 * duration
+            if est_bytes < MAX_UPLOAD_BYTES:
+                return f["url"]
+        return mp4s[-1]["url"]  # всё большое — берём самое лёгкое
+    return mp4s[0]["url"]
+
+
+async def analyze_twitter_content(url: str) -> TikTokContent:
+    """Анализирует твит через публичный API fxtwitter (без авторизации).
+    Видео → прямая ссылка на mp4, только фото → скачанные файлы.
+    При любой ошибке возвращает "unknown" — тогда скачает yt-dlp."""
+    result = TikTokContent()
+
+    m = TWITTER_STATUS_REGEX.search(url)
+    if not m:
+        return result
+    tweet_id = m.group(1)
+    result.video_source_id = f"twitter:{tweet_id}"
+
+    session = await get_http_session()
+    try:
+        timeout = aiohttp.ClientTimeout(total=6)
+        headers = {"User-Agent": "TikTokSaveBot/1.0"}
+        async with session.get(f"https://api.fxtwitter.com/status/{tweet_id}",
+                               headers=headers, timeout=timeout) as resp:
+            if resp.status != 200:
+                logging.warning(f"fxtwitter API HTTP {resp.status} for {url}")
+                return result
+            data = await resp.json(content_type=None)
+    except asyncio.TimeoutError:
+        logging.warning(f"fxtwitter API timeout for {url}")
+        return result
+    except Exception as e:
+        logging.debug(f"fxtwitter API failed for {url}: {e}")
+        return result
+
+    media = ((data or {}).get("tweet") or {}).get("media") or {}
+    videos = media.get("videos") or []
+    photos = media.get("photos") or []
+
+    if videos:
+        video_url = _pick_twitter_mp4(videos[0])
+        result.content_type = "video"
+        if video_url:
+            result.video_url = video_url
+            result.direct_url = video_url
+            logging.info("Twitter video direct URL via fxtwitter (fast path)")
+        return result
+
+    if photos:
+        image_urls = [p["url"] for p in photos if isinstance(p, dict) and p.get("url")]
+        downloaded = await _download_image_list(image_urls, "fxtwitter")
+        if downloaded:
+            result.content_type = "photos"
+            result.photo_paths = downloaded
+            result.direct_url = image_urls[0]
+            logging.info(f"Twitter photos via fxtwitter: {len(downloaded)} photos")
+    return result
+
+
 # =====================================================================
 #  BOT HANDLERS
 # =====================================================================
@@ -565,6 +662,7 @@ async def cmd_setup(message: Message):
         "  <li><b>TikTok</b> (видео и слайдшоу из фото)</li>\n"
         "  <li><b>YouTube</b> (видеоролики и Shorts)</li>\n"
         "  <li><b>Instagram</b> (Reels и публикации)</li>\n"
+        "  <li><b>X / Twitter</b> (видео и фото из твитов)</li>\n"
         "</ul>\n"
         "<p>Используйте команду <code>/disable</code> для отключения автоматической загрузки.</p>"
     )
@@ -603,6 +701,10 @@ def download_video(url: str, output_path: str, max_retries: int = 3):
         'max_filesize': 50 * 1024 * 1024,
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'merge_output_format': 'mp4',
+        # В твите (и плейлисте) может быть несколько видео — берём первое,
+        # иначе они перезапишут друг друга в одном outtmpl
+        'playlist_items': '1',
+        'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
         # YouTube требует JS-рантайм для решения n-challenge (иначе форматы
@@ -741,25 +843,31 @@ async def process_url(message: Message, url: str):
     photo_files = []  # для TikTok фото — будем чистить в finally
     direct_url_to_save = None  # Прямая ссылка для сохранения в БД
 
-    # Формируем shame-подпись для дубликатов
+    # Формируем shame-подпись для дубликатов: со ссылкой на первое такое видео в чате
     def _build_shame_caption() -> str | None:
         if not is_duplicate or not duplicate_info:
             return None
         parts = ["Аяйайай бака, скинул повторчик)"]
         dup_username = html.escape(duplicate_info["username"])
-        msg_link = get_message_link(message.chat.id, duplicate_info.get("bot_message_id"))
+        msg_link = get_message_link(
+            message.chat.id, duplicate_info.get("bot_message_id"),
+            chat_username=message.chat.username,
+        )
+        when = _human_when(duplicate_info.get("created_at"))
+        when_part = f" ({when})" if when else ""
+        parts.append(f"Первый кинул: {dup_username}{when_part}")
         if msg_link:
-            parts.append(f"Первый кинул: <a href=\"{msg_link}\">{dup_username}</a>")
-        else:
-            parts.append(f"Первый кинул: {dup_username}")
+            parts.append(f"<a href=\"{msg_link}\">Первое такое видео</a>")
         return "\n".join(parts)
 
     try:
         # ============================================================
-        #  TikTok: анализ контента через tikwm API
+        #  TikTok (tikwm API) и X/Twitter (fxtwitter API): анализ контента
         #  Определяет фото/видео + даёт прямые ссылки для скачивания
         # ============================================================
-        if TIKTOK_URL_REGEX.match(url):
+        is_tiktok = bool(TIKTOK_URL_REGEX.match(url))
+        is_twitter = bool(TWITTER_STATUS_REGEX.match(url))
+        if is_tiktok or is_twitter:
             try:
                 await _update_status(message.chat.id, status_msg_id, (
                     "<h3>📥 Загрузка медиа</h3>\n"
@@ -769,10 +877,13 @@ async def process_url(message: Message, url: str):
             except Exception:
                 pass
 
-            content = await analyze_tiktok_content(url)
+            if is_tiktok:
+                content = await analyze_tiktok_content(url)
+            else:
+                content = await analyze_twitter_content(url)
             direct_url_to_save = content.direct_url
 
-            # Если tikwm дал video_source_id (работает для коротких ссылок vm.tiktok.com)
+            # Если API дал video_source_id (работает для коротких ссылок vm.tiktok.com)
             if not video_source_id and content.video_source_id:
                 video_source_id = content.video_source_id
                 if not is_duplicate:
@@ -839,10 +950,10 @@ async def process_url(message: Message, url: str):
                     return  # Успешно отправили фото — выходим
 
                 except Exception as photo_send_err:
-                    logging.error(f"Failed to send TikTok photos: {photo_send_err}")
+                    logging.error(f"Failed to send photos: {photo_send_err}")
                     # Фото скачались но не отправились — продолжаем к видео
 
-            # --- TikTok ВИДЕО: прямое скачивание через tikwm (без yt-dlp!) ---
+            # --- ВИДЕО: прямое скачивание по ссылке из API (без yt-dlp!) ---
             if content.content_type == "video" and content.video_url:
                 try:
                     await _update_status(message.chat.id, status_msg_id, (
@@ -890,7 +1001,7 @@ async def process_url(message: Message, url: str):
                     # Падаем в yt-dlp ниже
 
         # ============================================================
-        #  Скачиваем видео через yt-dlp (YouTube, Instagram, TikTok fallback)
+        #  Скачиваем видео через yt-dlp (YouTube, Instagram, TikTok/X fallback)
         # ============================================================
         try:
             await _update_status(message.chat.id, status_msg_id, (
@@ -1304,6 +1415,7 @@ _PLATFORM_NAMES = {
     "tiktok": "TikTok",
     "youtube": "YouTube",
     "instagram": "Instagram",
+    "twitter": "X (Twitter)",
 }
 
 # Человеческие названия статусов индексации
