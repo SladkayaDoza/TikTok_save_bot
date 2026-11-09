@@ -33,6 +33,7 @@ from database import (
 )
 import embedding
 import transcription
+from telegram_session import CompatibleTelegramSession
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -45,7 +46,7 @@ MEDIA_DIR = "media"
 # выключено) выбирается там, клиент не создаётся на старте. Бот запускается
 # и работает даже без единого ключа — просто без этих функций.
 
-bot = Bot(token=TOKEN)
+bot = Bot(token=TOKEN, session=CompatibleTelegramSession())
 dp = Dispatcher()
 active_groups = set()
 # Группы, где включён семантический поиск. Включается только админом,

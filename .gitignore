@@ -197,3 +197,5 @@ sandbox/
 embed_queue/
 # Бэкапы базы, создаются автоматически перед миграцией
 video_stats.db.bak-*
+video_stats*.db
+embedding_map.html
