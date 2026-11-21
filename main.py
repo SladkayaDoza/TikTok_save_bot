@@ -722,10 +722,11 @@ def download_video(url: str, output_path: str, max_retries: int = 3):
         }],
     }
 
-    # Подключаем куки, если файл существует (критично для Instagram)
+    # Подключаем куки, если файл существует (нужны для приватного/18+ контента)
     if os.path.exists(cookies_path):
         ydl_opts['cookiefile'] = cookies_path
     last_error = None
+    tried_without_cookies = False
     for attempt in range(1, max_retries + 1):
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -734,6 +735,24 @@ def download_video(url: str, output_path: str, max_retries: int = 3):
         except yt_dlp.utils.DownloadError as e:
             last_error = e
             err_msg = str(e).lower()
+
+            # Протухшие/разлогиненные куки ломают запрос (Instagram отвечает
+            # HTTP 400 на "Downloading video info"), хотя без них публичный
+            # контент качается. Один раз пробуем без кук.
+            if 'cookiefile' in ydl_opts and not tried_without_cookies:
+                tried_without_cookies = True
+                logging.warning(f"Download with cookies failed ({e}). Retrying without cookies...")
+                ydl_opts.pop('cookiefile')
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([url])
+                    logging.warning("Downloaded without cookies — cookies.txt, похоже, протух, обнови его")
+                    return
+                except yt_dlp.utils.DownloadError as e2:
+                    last_error = e2
+                    # Без кук тоже не вышло — возвращаем их и идём по обычной логике
+                    ydl_opts['cookiefile'] = cookies_path
+
             # Retry только на временные ошибки (rehydration, rate limit, etc.)
             is_retryable = any(kw in err_msg for kw in [
                 'rehydration', 'unable to extract', 'http error 429',
@@ -1074,7 +1093,10 @@ async def process_url(message: Message, url: str):
                 "<p>Пожалуйста, попробуйте отправить ссылку ещё раз позже.</p>"
             )
         elif is_download_err:
-            escaped_err = html.escape(str(e)[:100])
+            # yt-dlp красит текст ANSI-кодами ("\x1b[0;31mERROR:\x1b[0m") — в чате это мусор
+            clean_err = re.sub(r'\x1b\[[0-9;]*m', '', str(e))
+            clean_err = re.sub(r'^\s*ERROR:\s*', '', clean_err)
+            escaped_err = html.escape(clean_err[:150])
             error_html = (
                 "<h3>❌ Ошибка загрузки</h3>\n"
                 "<p>Не удалось скачать медиа по указанной ссылке.</p>\n"
