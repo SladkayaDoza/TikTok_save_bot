@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime
 from dataclasses import dataclass, field
 import subprocess
+import sys
 import requests as http_requests
 import aiohttp
 from io import BytesIO
@@ -1861,7 +1862,89 @@ async def handle_message(message: Message):
 
     # Запускаем обработку каждой темы параллельно, как фоновые задачи
     for url in urls:
-        asyncio.create_task(process_url(message, url))
+        asyncio.create_task(_tracked_download(process_url(message, url)))
+
+
+# =====================================================================
+#  АВТООБНОВЛЕНИЕ YT-DLP
+# =====================================================================
+# Площадки (особенно Instagram) регулярно ломают экстракторы, а фиксы
+# выходят в новых версиях yt-dlp. Раз в YTDLP_UPDATE_HOURS бот ставит
+# свежую версию через pip и, если она поменялась, перезапускается —
+# предварительно дождавшись конца текущих загрузок. 0 — выключено.
+YTDLP_UPDATE_HOURS = float(os.getenv("YTDLP_UPDATE_HOURS", "24"))
+
+_active_downloads = 0
+_restart_requested = False
+
+
+async def _tracked_download(coro):
+    """Считает активные загрузки, чтобы не перезапускаться посреди скачивания."""
+    global _active_downloads
+    _active_downloads += 1
+    try:
+        await coro
+    finally:
+        _active_downloads -= 1
+
+
+def _installed_ytdlp_version() -> str | None:
+    """Версия yt-dlp на диске (в отдельном процессе: загруженный модуль — старый)."""
+    try:
+        out = subprocess.run(
+            [sys.executable, "-c", "import yt_dlp; print(yt_dlp.version.__version__)"],
+            capture_output=True, text=True, timeout=60,
+        )
+        return out.stdout.strip() or None
+    except Exception as e:
+        logging.error(f"Не удалось узнать версию yt-dlp: {e}")
+        return None
+
+
+def _pip_upgrade_ytdlp() -> tuple[bool, str]:
+    try:
+        out = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-U", "-q",
+             "--disable-pip-version-check", "yt-dlp[default]"],
+            capture_output=True, text=True, timeout=600,
+        )
+        return out.returncode == 0, (out.stderr or out.stdout)[-500:]
+    except Exception as e:
+        return False, str(e)
+
+
+async def ytdlp_auto_updater():
+    global _restart_requested
+    running_version = yt_dlp.version.__version__
+    while True:
+        ok, details = await asyncio.to_thread(_pip_upgrade_ytdlp)
+        if not ok:
+            logging.error(f"Автообновление yt-dlp не удалось: {details}")
+        else:
+            new_version = await asyncio.to_thread(_installed_ytdlp_version)
+            if new_version and new_version != running_version:
+                logging.warning(f"yt-dlp обновлён: {running_version} → {new_version}. Перезапуск...")
+                # Ждём, пока закончатся текущие загрузки (не дольше 10 минут)
+                for _ in range(120):
+                    if _active_downloads == 0:
+                        break
+                    await asyncio.sleep(5)
+                try:
+                    await bot.send_message(
+                        ADMIN_ID,
+                        f"🔄 yt-dlp обновлён: {running_version} → {new_version}. Бот перезапускается.",
+                    )
+                except Exception:
+                    pass
+                _restart_requested = True
+                try:
+                    await dp.stop_polling()
+                except RuntimeError as e:
+                    # polling ещё не стартовал — перезапуск всё равно произойдёт после выхода
+                    logging.warning(f"stop_polling: {e}")
+                return
+            logging.info(f"yt-dlp актуален: {running_version}")
+        await asyncio.sleep(YTDLP_UPDATE_HOURS * 3600)
 
 async def _handle_similar_found(chat_id: int, new_video_id: int,
                                 similar_video_id: int, score: float):
@@ -1919,12 +2002,20 @@ async def main():
             len(embedding_groups), embedding.unavailable_reason(),
         )
 
+    updater_task = None
+    if YTDLP_UPDATE_HOURS > 0:
+        updater_task = asyncio.create_task(ytdlp_auto_updater())
+
     print("Бот запущен!")
     try:
-        # Запускаем polling, игнорируем накопившиеся апдейты
-        await bot.delete_webhook(drop_pending_updates=True)
+        # Запускаем polling, игнорируем накопившиеся апдейты.
+        # После автоперезапуска не игнорируем: это сообщения за последние секунды.
+        auto_restarted = os.environ.pop("BOT_AUTO_RESTARTED", None) == "1"
+        await bot.delete_webhook(drop_pending_updates=not auto_restarted)
         await dp.start_polling(bot, allowed_updates=["message", "message_reaction"])
     finally:
+        if updater_task and not updater_task.done():
+            updater_task.cancel()
         if worker_task:
             worker_task.cancel()
             try:
@@ -1934,5 +2025,18 @@ async def main():
         if _http_session and not _http_session.closed:
             await _http_session.close()
 
+def _restart_process():
+    """Перезапускает бота тем же интерпретатором с теми же аргументами."""
+    os.environ["BOT_AUTO_RESTARTED"] = "1"
+    args = [sys.executable] + sys.argv
+    if os.name == "nt":
+        # os.execv на Windows не заменяет процесс, а отвязывает новый от консоли
+        subprocess.Popen(args)
+        sys.exit(0)
+    os.execv(sys.executable, args)
+
+
 if __name__ == "__main__":
     asyncio.run(main())
+    if _restart_requested:
+        _restart_process()
