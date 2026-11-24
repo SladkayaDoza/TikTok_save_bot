@@ -188,6 +188,7 @@ RICH_MESSAGES_GUIDE.md
 iloveimg-compressed.zip
 APP_LOGIC.md
 active_groups.json
+bot_settings.json
 media/
 
 # Песочница для экспериментов с эмбеддингами (медиа, JSON-эмбеддинги, кэш)

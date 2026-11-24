@@ -21,7 +21,8 @@ from aiogram.filters import Command
 from aiogram.types import (
     Message, FSInputFile, InputMediaVideo, InputMediaPhoto,
     InputMediaAnimation, InputMediaDocument,
-    MessageReactionUpdated,
+    MessageReactionUpdated, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
 )
 import yt_dlp
 import dotenv
@@ -37,6 +38,7 @@ from database import (
 )
 import embedding
 import transcription
+from bot_settings import Setting, SettingsStore
 from telegram_session import CompatibleTelegramSession
 
 # --- CONFIGURATION ---
@@ -296,6 +298,8 @@ class TikTokContent:
     direct_url: str | None = None         # Прямая ссылка для сохранения в БД
     video_source_id: str | None = None    # "tiktok:7234567890"
     photo_total: int = 0                  # Сколько фото в посте (для «скачано N из M»)
+    video_file: str | None = None         # Видео уже скачано сюда (свой парсер TikTok)
+    via: str = ""                         # Кто разобрал: tiktok_page | tikwm | fxtwitter
 
 
 def extract_video_source_id(url: str) -> str | None:
@@ -352,8 +356,9 @@ _DL_PART_SIZE = 1024 * 1024
 _DL_MAX_PARALLEL = 8
 
 
-async def _download_single_stream(session, url: str, output_path: str) -> bool:
-    async with session.get(url, headers=_DL_HEADERS) as resp:
+async def _download_single_stream(session, url: str, output_path: str,
+                                  headers: dict | None = None) -> bool:
+    async with session.get(url, headers=headers or _DL_HEADERS) as resp:
         if resp.status != 200:
             logging.warning(f"Direct download failed: HTTP {resp.status}")
             return False
@@ -363,16 +368,20 @@ async def _download_single_stream(session, url: str, output_path: str) -> bool:
     return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
 
 
-async def download_video_direct(url: str, output_path: str) -> bool:
+async def download_video_direct(url: str, output_path: str,
+                                session: aiohttp.ClientSession | None = None,
+                                headers: dict | None = None) -> bool:
     """Скачивает видео напрямую через aiohttp (без yt-dlp).
     Используется, когда API (tikwm / fxtwitter) дал прямую ссылку.
-    Если сервер поддерживает Range — качает в несколько потоков."""
-    session = await get_http_session()
+    Если сервер поддерживает Range — качает в несколько потоков.
+    session/headers — для CDN, которому нужны куки страницы (TikTok)."""
+    session = session or await get_http_session()
+    base_headers = headers or _DL_HEADERS
     timeout = aiohttp.ClientTimeout(total=120, sock_read=30)
     try:
         # Первый кусок заодно сообщает полный размер (Content-Range: bytes 0-N/TOTAL)
         first_end = _DL_PART_SIZE - 1
-        async with session.get(url, headers={**_DL_HEADERS, "Range": f"bytes=0-{first_end}"},
+        async with session.get(url, headers={**base_headers, "Range": f"bytes=0-{first_end}"},
                                timeout=timeout) as resp:
             if resp.status == 200:
                 # Range не поддерживается — сервер отдаёт файл целиком, просто дочитываем
@@ -387,7 +396,7 @@ async def download_video_direct(url: str, output_path: str) -> bool:
             first_part = await resp.read()
 
         if total <= 0:
-            return await _download_single_stream(session, url, output_path)
+            return await _download_single_stream(session, url, output_path, base_headers)
 
         with open(output_path, "wb") as f:
             f.truncate(total)
@@ -402,7 +411,7 @@ async def download_video_direct(url: str, output_path: str) -> bool:
                 for attempt in range(3):
                     try:
                         async with session.get(
-                            url, headers={**_DL_HEADERS, "Range": f"bytes={start}-{end}"},
+                            url, headers={**base_headers, "Range": f"bytes={start}-{end}"},
                             timeout=timeout,
                         ) as r:
                             if r.status != 206:
@@ -551,10 +560,11 @@ async def _download_one_image(session: aiohttp.ClientSession, img_url: str,
     return None
 
 
-async def _download_image_list(image_urls: list[str], source_name: str) -> list[str]:
+async def _download_image_list(image_urls: list[str], source_name: str,
+                               session: aiohttp.ClientSession | None = None) -> list[str]:
     """Скачивает ВСЕ изображения параллельно (порядок сохраняется), с повторами.
     Возвращает пути к успешно скачанным файлам."""
-    session = await get_http_session()
+    session = session or await get_http_session()
     results = await asyncio.gather(*(
         _download_one_image(session, u, i, source_name)
         for i, u in enumerate(image_urls)
@@ -620,7 +630,111 @@ async def resolve_tiktok_short_url(url: str) -> str:
     return url
 
 
-async def analyze_tiktok_content(url: str) -> TikTokContent:
+# Свой парсер страницы TikTok вместо tikwm (tikwm остаётся запасным).
+# 0 — сразу идти в tikwm, как раньше.
+TIKTOK_SCRAPER = os.getenv("TIKTOK_SCRAPER", "1") != "0"
+
+# Интервал автообновления yt-dlp в часах, 0 — выключено (см. ytdlp_auto_updater)
+YTDLP_UPDATE_HOURS = float(os.getenv("YTDLP_UPDATE_HOURS", "24"))
+
+_TT_PAGE_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_TT_DATA_RE = re.compile(
+    r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', re.S
+)
+
+
+def _pick_tiktok_bitrate(video: dict) -> str | None:
+    """Самый качественный вариант видео, который влезает в лимит Telegram."""
+    variants = []
+    for b in video.get("bitrateInfo") or []:
+        addr = b.get("PlayAddr") or {}
+        urls = addr.get("UrlList") or []
+        if not urls:
+            continue
+        size = int(addr.get("DataSize") or 0)
+        variants.append((int(b.get("Bitrate") or 0), size, urls[0]))
+    variants.sort(reverse=True)
+    for _bitrate, size, u in variants:
+        if 0 < size < MAX_UPLOAD_BYTES:
+            return u
+    if variants:
+        return variants[-1][2]
+    return video.get("playAddr") or None
+
+
+async def scrape_tiktok_content(tiktok_id: str, output_path: str) -> TikTokContent | None:
+    """Свой разбор страницы TikTok (~0.7 с против 2-4 с у tikwm).
+
+    Данные лежат JSON-ом прямо в HTML. CDN отдаёт видео только с куками
+    этой же сессии, поэтому видео сразу и качаем — той же сессией.
+    Любая неожиданность → None, и работает запасной tikwm.
+    """
+    result = TikTokContent(video_source_id=f"tiktok:{tiktok_id}", via="tiktok_page")
+    # Отдельная сессия: свои куки на каждый ролик, не смешиваются с остальным ботом
+    async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar()) as session:
+        try:
+            t0 = time.monotonic()
+            # /video/ работает и для фото-постов; имя автора TikTok не проверяет
+            page_url = f"https://www.tiktok.com/@_/video/{tiktok_id}"
+            timeout = aiohttp.ClientTimeout(total=6)
+            async with session.get(page_url, headers=_TT_PAGE_HEADERS, timeout=timeout) as resp:
+                if resp.status != 200:
+                    logging.warning(f"TikTok page HTTP {resp.status} for {tiktok_id}")
+                    return None
+                page = await resp.text()
+            m = _TT_DATA_RE.search(page)
+            if not m:
+                logging.warning(f"TikTok page без данных для {tiktok_id} (капча/блок?)")
+                return None
+            detail = json.loads(m.group(1)).get("__DEFAULT_SCOPE__", {}).get("webapp.video-detail") or {}
+            if detail.get("statusCode") not in (0, None):
+                logging.warning(f"TikTok page statusCode={detail.get('statusCode')} for {tiktok_id}")
+                return None
+            item = (detail.get("itemInfo") or {}).get("itemStruct") or {}
+            if not item:
+                return None
+
+            images = ((item.get("imagePost") or {}).get("images")) or []
+            image_urls = [
+                (im.get("imageURL") or {}).get("urlList", [None])[0] for im in images
+            ]
+            image_urls = [u for u in image_urls if u]
+            if image_urls:
+                result.content_type = "photos"
+                result.photo_total = len(image_urls)
+                result.direct_url = image_urls[0]
+                result.photo_paths = await _download_image_list(image_urls, "tiktok-page", session)
+                if not result.photo_paths:
+                    return None
+                logging.info(f"TikTok slideshow via page: {len(result.photo_paths)}/{len(image_urls)} photos")
+                return result
+
+            t_page = time.monotonic() - t0
+            video_url = _pick_tiktok_bitrate(item.get("video") or {})
+            if not video_url:
+                return None
+            headers = {**_TT_PAGE_HEADERS, "Referer": "https://www.tiktok.com/"}
+            if not await download_video_direct(video_url, output_path, session=session, headers=headers):
+                logging.warning(f"TikTok page: видео не скачалось для {tiktok_id}")
+                return None
+            result.content_type = "video"
+            result.video_file = output_path
+            result.direct_url = video_url
+            size_mb = os.path.getsize(output_path) / 1024 / 1024
+            t_dl = time.monotonic() - t0 - t_page
+            logging.info(f"TikTok video via page: page {t_page:.2f}s, "
+                         f"download {t_dl:.2f}s ({size_mb:.1f} MB)")
+            return result
+        except Exception as e:
+            logging.warning(f"TikTok page parse failed for {tiktok_id}: {e}")
+            return None
+
+
+async def analyze_tiktok_content(url: str, output_path: str | None = None) -> TikTokContent:
     """Анализирует TikTok URL через tikwm API.
     Определяет тип контента (фото/видео), извлекает прямые ссылки.
     Для фото — скачивает файлы. Для видео — возвращает direct URL.
@@ -631,6 +745,17 @@ async def analyze_tiktok_content(url: str) -> TikTokContent:
     if not TIKTOK_URL_REGEX.match(url):
         return result
 
+    # Сначала свой парсер страницы — он в 3 раза быстрее tikwm
+    m = re.search(r'tiktok\.com/.*/(?:video|photo)/(\d+)', url)
+    if m and output_path and TIKTOK_SCRAPER:
+        scraped = await scrape_tiktok_content(m.group(1), output_path)
+        if scraped:
+            return scraped
+        # Наполовину скачанное не оставляем
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+    result.via = "tikwm"
     data = await _tikwm_request(url)
     if not data:
         logging.error(f"tikwm не ответил для {url}, пробуем yt-dlp")
@@ -985,6 +1110,9 @@ async def process_url(message: Message, url: str):
     if is_tiktok and not extract_video_source_id(url):
         url = await resolve_tiktok_short_url(url)
         mark("resolve")
+    elif is_tiktok:
+        # Хвост ?_r=1&u_code=...&share_link_id=... — трекинг шаринга, он не нужен
+        url = url.split("?")[0]
 
     domain = get_domain_name(url)
     escaped_url = html.escape(url)
@@ -1104,11 +1232,11 @@ async def process_url(message: Message, url: str):
             ))
 
             if is_tiktok:
-                content = await analyze_tiktok_content(url)
+                content = await analyze_tiktok_content(url, output_path)
             else:
                 content = await analyze_twitter_content(url)
             direct_url_to_save = content.direct_url
-            mark("tikwm" if is_tiktok else "fxtwitter")
+            mark(content.via or ("tikwm" if is_tiktok else "fxtwitter"))
 
             # Если API дал video_source_id (работает для коротких ссылок vm.tiktok.com)
             if not video_source_id and content.video_source_id:
@@ -1206,15 +1334,18 @@ async def process_url(message: Message, url: str):
                 raise RuntimeError("TikTok отдал слайдшоу, но ни одно фото не скачалось")
 
             # --- ВИДЕО: прямое скачивание по ссылке из API (без yt-dlp!) ---
-            if content.content_type == "video" and content.video_url:
+            if content.content_type == "video" and (content.video_file or content.video_url):
                 _bg_status((
                         "<h3>📥 Загрузка медиа</h3>\n"
                         "<p>Статус: 🟡 <b>Скачивание видео (fast)...</b></p>\n"
                         f"<p>Источник: <a href=\"{escaped_url}\">{domain}</a></p>"
                 ))
 
-                direct_ok = await download_video_direct(content.video_url, output_path)
-                mark("download")
+                if content.video_file:
+                    direct_ok = True  # свой парсер уже скачал (время — в tiktok_page)
+                else:
+                    direct_ok = await download_video_direct(content.video_url, output_path)
+                    mark("download")
                 if direct_ok:
                     # Видео скачано напрямую — отправляем
                     shame_caption = _build_shame_caption()
@@ -2093,6 +2224,207 @@ async def cmd_embed_retry(message: Message):
     await send_rich_message(message.chat.id, body, reply_to_message_id=message.message_id)
 
 
+# =====================================================================
+#  /update — git pull + перезапуск (только админ, только в личке)
+# =====================================================================
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _run(cmd: list[str], timeout: int = 120) -> tuple[bool, str]:
+    try:
+        out = subprocess.run(cmd, cwd=REPO_DIR, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=timeout)
+        return out.returncode == 0, ((out.stdout or "") + (out.stderr or "")).strip()
+    except Exception as e:
+        return False, str(e)
+
+
+def _do_update() -> dict:
+    """git pull --ff-only; при изменении requirements.txt — pip install;
+    перед перезапуском проверяет, что код компилируется."""
+    ok, old = _run(["git", "rev-parse", "HEAD"])
+    if not ok:
+        return {"ok": False, "stage": "git rev-parse", "out": old}
+
+    ok, pull_out = _run(["git", "pull", "--ff-only"])
+    if not ok:
+        return {"ok": False, "stage": "git pull", "out": pull_out}
+
+    _, new = _run(["git", "rev-parse", "HEAD"])
+    if new == old:
+        return {"ok": True, "changed": False}
+
+    _, log = _run(["git", "log", "--oneline", "--no-decorate", "-n", "15", f"{old}..{new}"])
+    _, files = _run(["git", "diff", "--name-only", old, new])
+    changed_files = files.splitlines()
+
+    pip_out = None
+    if "requirements.txt" in changed_files:
+        ok, pip_out = _run([sys.executable, "-m", "pip", "install", "-q",
+                            "--disable-pip-version-check", "-r", "requirements.txt"], timeout=900)
+        if not ok:
+            return {"ok": False, "stage": "pip install", "out": pip_out, "log": log}
+
+    # Сломанный код после рестарта не поднимется — проверяем заранее
+    py_files = [f for f in os.listdir(REPO_DIR) if f.endswith(".py")]
+    ok, compile_out = _run([sys.executable, "-m", "py_compile", *py_files])
+    if not ok:
+        return {"ok": False, "stage": "py_compile", "out": compile_out, "log": log}
+
+    return {"ok": True, "changed": True, "log": log,
+            "old": old[:7], "new": new[:7], "pip": pip_out is not None}
+
+
+@dp.message(Command("update"))
+async def cmd_update(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    if message.chat.type != "private":
+        return
+
+    force = "force" in (message.text or "").lower()
+    status = await message.answer("⏳ Обновляюсь: <code>git pull</code>...", parse_mode="HTML")
+    res = await asyncio.to_thread(_do_update)
+
+    if not res["ok"]:
+        text = (f"❌ Обновление остановлено на шаге <b>{res['stage']}</b>, "
+                f"бот работает на старой версии.\n"
+                f"<pre>{html.escape(res['out'][-3000:])}</pre>")
+        if res["stage"] in ("pip install", "py_compile"):
+            text += "\n⚠️ Новый код уже на диске — до исправления не перезапускай бота руками."
+        await status.edit_text(text, parse_mode="HTML")
+        return
+
+    if not res["changed"] and not force:
+        await status.edit_text(
+            "✅ Уже последняя версия, перезапуск не нужен.\n"
+            "Перезапустить всё равно: <code>/update force</code>", parse_mode="HTML")
+        return
+
+    if res["changed"]:
+        version = res["new"]
+        text = (f"✅ Обновлено <code>{res['old']}</code> → <code>{res['new']}</code>"
+                + (" (+ зависимости)" if res["pip"] else "") + "\n"
+                f"<pre>{html.escape(res['log'][-3000:])}</pre>\n")
+    else:
+        version = None
+        text = "✅ Изменений нет, перезапускаю по запросу.\n"
+    busy = f" (жду {_active_downloads} загрузок)" if _active_downloads else ""
+    await status.edit_text(text + f"🔄 Перезапускаюсь{busy}...", parse_mode="HTML")
+
+    # Новый процесс прочитает это из окружения и отчитается, что поднялся
+    os.environ["BOT_RESTART_NOTICE"] = (
+        f"✅ Бот перезапущен, версия {version}." if version else "✅ Бот перезапущен."
+    )
+    await graceful_restart()
+
+
+# =====================================================================
+#  /settings — переключатели вместо правки .env (только админ, в личке)
+# =====================================================================
+_this_module = sys.modules[__name__]
+
+settings_store = SettingsStore([
+    Setting("TIKTOK_SCRAPER", "TikTok: свой парсер", _this_module, "TIKTOK_SCRAPER",
+            [(True, "✅ вкл"), (False, "❌ выкл (tikwm)")],
+            "свой разбор страницы ~1.5 с; выкл — всегда через tikwm (5-9 с)"),
+    Setting("YTDLP_UPDATE_HOURS", "Автообновление yt-dlp", _this_module, "YTDLP_UPDATE_HOURS",
+            [(24.0, "раз в 24 ч"), (12.0, "раз в 12 ч"), (6.0, "раз в 6 ч"),
+             (48.0, "раз в 48 ч"), (0.0, "❌ выкл")],
+            "pip install -U и перезапуск, если вышла новая версия"),
+    Setting("TRANSCRIBE_PROVIDER", "Распознавание речи", transcription, "TRANSCRIBE_PROVIDER",
+            [("auto", "авто"), ("deepinfra", "DeepInfra"), ("openrouter", "OpenRouter"),
+             ("off", "❌ выкл")],
+            "команда meow и транскрипт для поиска"),
+    Setting("VLM_POLICY", "Описание кадров (VLM)", embedding, "VLM_POLICY",
+            [("always", "всегда"), ("no_speech", "только без речи"), ("never", "❌ никогда")],
+            "главный рычаг стоимости поиска; «всегда» — точнее всего"),
+    Setting("VLM_FRAMES", "Кадров в VLM", embedding, "VLM_FRAMES",
+            [(4, "4"), (6, "6"), (8, "8"), (2, "2")],
+            "больше кадров — точнее описание, но дороже"),
+    Setting("EMBED_MONTHLY_LIMIT_USD", "Лимит на месяц", embedding, "MONTHLY_LIMIT_USD",
+            [(5.0, "$5"), (10.0, "$10"), (20.0, "$20"), (1.0, "$1"), (2.0, "$2"),
+             (0.0, "без лимита")],
+            "при исчерпании индексация встаёт, видео качаются как обычно"),
+    Setting("EMBED_SIMILAR_THRESHOLD", "Подсказка «похоже»", embedding, "SIMILAR_NOTIFY_THRESHOLD",
+            [(1.0, "❌ выкл"), (0.9, "от 90%"), (0.85, "от 85%"), (0.8, "от 80%")],
+            "бот сам подписывает ссылку на похожий ролик"),
+    Setting("EMBED_FIND_MIN_SCORE", "Порог выдачи /find", embedding, "FIND_MIN_SCORE",
+            [(0.2, "0.20"), (0.25, "0.25"), (0.3, "0.30"), (0.1, "0.10"), (0.15, "0.15")],
+            "результаты ниже порога не показываются"),
+])
+
+
+def _settings_text() -> str:
+    lines = ["<b>⚙️ Настройки бота</b>",
+             "Нажми на кнопку — значение переключится на следующее и сразу применится.",
+             "<i>* — изменено здесь, без звёздочки — значение из .env</i>", ""]
+    for st in settings_store.settings:
+        mark = " *" if settings_store.is_overridden(st.key) else ""
+        lines.append(f"<b>{html.escape(st.title)}</b>: {html.escape(st.label(st.current()))}{mark}")
+        if st.hint:
+            lines.append(f"  <i>{html.escape(st.hint)}</i>")
+    return "\n".join(lines)
+
+
+def _settings_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for i, st in enumerate(settings_store.settings):
+        mark = " *" if settings_store.is_overridden(st.key) else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{st.title}: {st.label(st.current())}{mark}",
+            callback_data=f"set:{i}",
+        )])
+    rows.append([
+        InlineKeyboardButton(text="↩️ Сбросить к .env", callback_data="set:reset"),
+        InlineKeyboardButton(text="✖️ Закрыть", callback_data="set:close"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    if message.chat.type != "private":
+        return
+    await message.answer(_settings_text(), parse_mode="HTML",
+                         reply_markup=_settings_keyboard())
+
+
+@dp.callback_query(F.data.startswith("set:"))
+async def on_settings_button(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id != ADMIN_ID:
+        await callback.answer("Только для админа", show_alert=True)
+        return
+
+    action = callback.data.split(":", 1)[1]
+    if action == "close":
+        await callback.message.delete()
+        await callback.answer()
+        return
+
+    if action == "reset":
+        settings_store.reset()
+        note = "Все настройки сброшены к .env"
+    else:
+        try:
+            st = settings_store.settings[int(action)]
+        except (ValueError, IndexError):
+            await callback.answer("Устаревшая кнопка — открой /settings заново")
+            return
+        value = settings_store.cycle(st.key)
+        note = f"{st.title}: {st.label(value)}"
+        logging.info(f"Админ изменил настройку {st.key} = {value!r}")
+
+    try:
+        await callback.message.edit_text(_settings_text(), parse_mode="HTML",
+                                         reply_markup=_settings_keyboard())
+    except Exception as e:
+        logging.debug(f"settings edit: {e}")  # «message is not modified» и т.п.
+    await callback.answer(note)
+
+
 @dp.message(F.text)
 async def handle_message(message: Message):
     # Если это группа, и она не инициализирована — игнорируем
@@ -2117,7 +2449,6 @@ async def handle_message(message: Message):
 # выходят в новых версиях yt-dlp. Раз в YTDLP_UPDATE_HOURS бот ставит
 # свежую версию через pip и, если она поменялась, перезапускается —
 # предварительно дождавшись конца текущих загрузок. 0 — выключено.
-YTDLP_UPDATE_HOURS = float(os.getenv("YTDLP_UPDATE_HOURS", "24"))
 
 _active_downloads = 0
 _restart_requested = False
@@ -2158,10 +2489,42 @@ def _pip_upgrade_ytdlp() -> tuple[bool, str]:
         return False, str(e)
 
 
-async def ytdlp_auto_updater():
+async def graceful_restart(notice: str | None = None):
+    """Дожидается конца текущих загрузок (не дольше 10 минут), пишет админу
+    и останавливает polling. Сам перезапуск делает _restart_process() после
+    выхода из main()."""
     global _restart_requested
+    if _restart_requested:
+        return
+    _restart_requested = True
+    for _ in range(120):
+        if _active_downloads == 0:
+            break
+        await asyncio.sleep(5)
+    if notice:
+        try:
+            await bot.send_message(ADMIN_ID, notice)
+        except Exception:
+            pass
+    try:
+        await dp.stop_polling()
+    except RuntimeError as e:
+        # polling ещё не стартовал — перезапуск всё равно произойдёт после выхода
+        logging.warning(f"stop_polling: {e}")
+
+
+async def ytdlp_auto_updater():
+    """Работает всегда; интервал (и выключение — 0) берётся из настройки
+    на каждом круге, поэтому меняется из /settings без перезапуска."""
     running_version = yt_dlp.version.__version__
+    last_check = None
     while True:
+        hours = YTDLP_UPDATE_HOURS
+        loop_time = asyncio.get_running_loop().time()
+        if hours <= 0 or (last_check is not None and loop_time - last_check < hours * 3600):
+            await asyncio.sleep(60)
+            continue
+        last_check = loop_time
         ok, details = await asyncio.to_thread(_pip_upgrade_ytdlp)
         if not ok:
             logging.error(f"Автообновление yt-dlp не удалось: {details}")
@@ -2169,27 +2532,11 @@ async def ytdlp_auto_updater():
             new_version = await asyncio.to_thread(_installed_ytdlp_version)
             if new_version and new_version != running_version:
                 logging.warning(f"yt-dlp обновлён: {running_version} → {new_version}. Перезапуск...")
-                # Ждём, пока закончатся текущие загрузки (не дольше 10 минут)
-                for _ in range(120):
-                    if _active_downloads == 0:
-                        break
-                    await asyncio.sleep(5)
-                try:
-                    await bot.send_message(
-                        ADMIN_ID,
-                        f"🔄 yt-dlp обновлён: {running_version} → {new_version}. Бот перезапускается.",
-                    )
-                except Exception:
-                    pass
-                _restart_requested = True
-                try:
-                    await dp.stop_polling()
-                except RuntimeError as e:
-                    # polling ещё не стартовал — перезапуск всё равно произойдёт после выхода
-                    logging.warning(f"stop_polling: {e}")
+                await graceful_restart(
+                    f"🔄 yt-dlp обновлён: {running_version} → {new_version}. Бот перезапускается."
+                )
                 return
             logging.info(f"yt-dlp актуален: {running_version}")
-        await asyncio.sleep(YTDLP_UPDATE_HOURS * 3600)
 
 async def _handle_similar_found(chat_id: int, new_video_id: int,
                                 similar_video_id: int, score: float):
@@ -2224,6 +2571,7 @@ async def main():
     os.makedirs(TEMP_DIR, exist_ok=True)
     os.makedirs(MEDIA_DIR, exist_ok=True)
     load_data()
+    settings_store.load()
     init_db()
 
     # Поисковый индекс держим в памяти: пара тысяч векторов — единицы мегабайт
@@ -2247,9 +2595,7 @@ async def main():
             len(embedding_groups), embedding.unavailable_reason(),
         )
 
-    updater_task = None
-    if YTDLP_UPDATE_HOURS > 0:
-        updater_task = asyncio.create_task(ytdlp_auto_updater())
+    updater_task = asyncio.create_task(ytdlp_auto_updater())
 
     print("Бот запущен!")
     try:
@@ -2257,7 +2603,13 @@ async def main():
         # После автоперезапуска не игнорируем: это сообщения за последние секунды.
         auto_restarted = os.environ.pop("BOT_AUTO_RESTARTED", None) == "1"
         await bot.delete_webhook(drop_pending_updates=not auto_restarted)
-        await dp.start_polling(bot, allowed_updates=["message", "message_reaction"])
+        restart_notice = os.environ.pop("BOT_RESTART_NOTICE", None)
+        if restart_notice:
+            try:
+                await bot.send_message(ADMIN_ID, restart_notice)
+            except Exception as e:
+                logging.warning(f"Не удалось отправить уведомление о перезапуске: {e}")
+        await dp.start_polling(bot, allowed_updates=["message", "message_reaction", "callback_query"])
     finally:
         if updater_task and not updater_task.done():
             updater_task.cancel()
