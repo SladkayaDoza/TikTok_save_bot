@@ -10,6 +10,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
+import socket
 import subprocess
 import sys
 import time
@@ -647,8 +648,12 @@ _TT_DATA_RE = re.compile(
 )
 
 
-def _pick_tiktok_bitrate(video: dict) -> str | None:
-    """Самый качественный вариант видео, который влезает в лимит Telegram."""
+def _tiktok_video_candidates(video: dict) -> list[str]:
+    """Ссылки на видео по убыванию качества (только влезающие в лимит Telegram).
+
+    У каждого варианта несколько зеркал (v16/v19...), и иногда одно из них
+    отвечает 403 — поэтому возвращаем все, а не только первое.
+    """
     variants = []
     for b in video.get("bitrateInfo") or []:
         addr = b.get("PlayAddr") or {}
@@ -656,14 +661,46 @@ def _pick_tiktok_bitrate(video: dict) -> str | None:
         if not urls:
             continue
         size = int(addr.get("DataSize") or 0)
-        variants.append((int(b.get("Bitrate") or 0), size, urls[0]))
-    variants.sort(reverse=True)
-    for _bitrate, size, u in variants:
-        if 0 < size < MAX_UPLOAD_BYTES:
-            return u
-    if variants:
-        return variants[-1][2]
-    return video.get("playAddr") or None
+        variants.append((int(b.get("Bitrate") or 0), size, urls))
+    variants.sort(key=lambda v: v[0], reverse=True)
+
+    fitting = [v for v in variants if 0 < v[1] < MAX_UPLOAD_BYTES] or variants[-1:]
+    candidates = [u for _b, _s, urls in fitting for u in urls]
+    candidates += [video.get("playAddr"), video.get("downloadAddr")]
+
+    seen, result = set(), []
+    for u in candidates:
+        if u and u not in seen:
+            seen.add(u)
+            result.append(u)
+    return result[:6]
+
+
+# Предохранитель: если CDN подряд отказывает своему парсеру, не тратим
+# на него время у каждой ссылки — на полчаса идём сразу в tikwm
+_TT_FAIL_LIMIT = 3
+_TT_COOLDOWN_SEC = 30 * 60
+_tt_fail_streak = 0
+_tt_disabled_until = 0.0
+
+
+def _tt_scraper_failed(reason: str):
+    global _tt_fail_streak, _tt_disabled_until
+    _tt_fail_streak += 1
+    if _tt_fail_streak >= _TT_FAIL_LIMIT:
+        _tt_disabled_until = time.monotonic() + _TT_COOLDOWN_SEC
+        _tt_fail_streak = 0
+        logging.error(f"Свой парсер TikTok {_TT_FAIL_LIMIT} раза подряд не смог скачать "
+                      f"({reason}) — на {_TT_COOLDOWN_SEC // 60} мин работаем через tikwm")
+
+
+def _tt_scraper_ok():
+    global _tt_fail_streak
+    _tt_fail_streak = 0
+
+
+def tt_scraper_active() -> bool:
+    return TIKTOK_SCRAPER and time.monotonic() >= _tt_disabled_until
 
 
 async def scrape_tiktok_content(tiktok_id: str, output_path: str) -> TikTokContent | None:
@@ -674,8 +711,11 @@ async def scrape_tiktok_content(tiktok_id: str, output_path: str) -> TikTokConte
     Любая неожиданность → None, и работает запасной tikwm.
     """
     result = TikTokContent(video_source_id=f"tiktok:{tiktok_id}", via="tiktok_page")
-    # Отдельная сессия: свои куки на каждый ролик, не смешиваются с остальным ботом
-    async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar()) as session:
+    # Отдельная сессия: свои куки на каждый ролик, не смешиваются с остальным ботом.
+    # Только IPv4: ссылка на видео подписана под адрес, с которого открыли
+    # страницу, и если видео пойдёт по IPv6, а страница по IPv4 — CDN даст 403.
+    connector = aiohttp.TCPConnector(family=socket.AF_INET)
+    async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(), connector=connector) as session:
         try:
             t0 = time.monotonic()
             # /video/ работает и для фото-постов; имя автора TikTok не проверяет
@@ -714,13 +754,25 @@ async def scrape_tiktok_content(tiktok_id: str, output_path: str) -> TikTokConte
                 return result
 
             t_page = time.monotonic() - t0
-            video_url = _pick_tiktok_bitrate(item.get("video") or {})
-            if not video_url:
+            candidates = _tiktok_video_candidates(item.get("video") or {})
+            if not candidates:
                 return None
             headers = {**_TT_PAGE_HEADERS, "Referer": "https://www.tiktok.com/"}
-            if not await download_video_direct(video_url, output_path, session=session, headers=headers):
-                logging.warning(f"TikTok page: видео не скачалось для {tiktok_id}")
+            video_url = None
+            for candidate in candidates:
+                if await download_video_direct(candidate, output_path, session=session, headers=headers):
+                    video_url = candidate
+                    break
+            if not video_url:
+                cookies = sorted({c.key for c in session.cookie_jar})
+                hosts = sorted({c.split("/")[2] for c in candidates if "//" in c})
+                logging.warning(
+                    f"TikTok page: видео не скачалось для {tiktok_id}. "
+                    f"Пробовал {len(candidates)} ссылок на {hosts}; куки: {cookies}"
+                )
+                _tt_scraper_failed("CDN отказал")
                 return None
+            _tt_scraper_ok()
             result.content_type = "video"
             result.video_file = output_path
             result.direct_url = video_url
@@ -747,7 +799,7 @@ async def analyze_tiktok_content(url: str, output_path: str | None = None) -> Ti
 
     # Сначала свой парсер страницы — он в 3 раза быстрее tikwm
     m = re.search(r'tiktok\.com/.*/(?:video|photo)/(\d+)', url)
-    if m and output_path and TIKTOK_SCRAPER:
+    if m and output_path and tt_scraper_active():
         scraped = await scrape_tiktok_content(m.group(1), output_path)
         if scraped:
             return scraped
@@ -1493,7 +1545,7 @@ async def process_url(message: Message, url: str):
         total = time.monotonic() - t_start
         parts = " | ".join(f"{name} {sec:.2f}" for name, sec in stages)
         lag = f"{tg_lag:.1f}s" if tg_lag is not None else "?"
-        logging.info(f"⏱ {original_url}: total {total:.2f}s (tg_lag {lag}) | {parts}")
+        logging.info(f"⏱ {url}: total {total:.2f}s (tg_lag {lag}) | {parts}")
         for f in glob.glob(os.path.join(TEMP_DIR, f"{video_id}*")):
             try:
                 os.remove(f)
