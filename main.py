@@ -805,12 +805,24 @@ async def scrape_tiktok_content(tiktok_id: str, output_path: str) -> TikTokConte
             candidates = _tiktok_video_candidates(item.get("video") or {})
             if not candidates:
                 return None
-            headers = {**_TT_PAGE_HEADERS, "Referer": "https://www.tiktok.com/"}
+            # Куки отдаём CDN сами, «сырыми». aiohttp >= 3.12 берёт значения
+            # с '=' в кавычки (tt_chain_token="abc=="), а CDN TikTok кавычки
+            # не снимает и отвечает 403. Поэтому видео качаем отдельной сессией
+            # без банка кук — иначе он слил бы наш заголовок со своим и снова
+            # расставил кавычки.
+            raw_cookie = "; ".join(f"{c.key}={c.value}" for c in session.cookie_jar)
+            headers = {**_TT_PAGE_HEADERS, "Referer": "https://www.tiktok.com/",
+                       "Cookie": raw_cookie}
             video_url = None
-            for candidate in candidates:
-                if await download_video_direct(candidate, output_path, session=session, headers=headers):
-                    video_url = candidate
-                    break
+            async with aiohttp.ClientSession(
+                cookie_jar=aiohttp.DummyCookieJar(),
+                connector=aiohttp.TCPConnector(family=socket.AF_INET),
+            ) as dl_session:
+                for candidate in candidates:
+                    if await download_video_direct(candidate, output_path,
+                                                   session=dl_session, headers=headers):
+                        video_url = candidate
+                        break
             if not video_url:
                 cookies = sorted({c.key for c in session.cookie_jar})
                 hosts = sorted({c.split("/")[2] for c in candidates if "//" in c})
