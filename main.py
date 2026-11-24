@@ -312,6 +312,10 @@ def extract_video_source_id(url: str) -> str | None:
     m = re.search(r'tiktok\.com/.*/(?:video|photo)/(\d+)', url)
     if m:
         return f"tiktok:{m.group(1)}"
+    # Мобильная форма из редиректа коротких ссылок: m.tiktok.com/v/ID.html
+    m = re.search(r'tiktok\.com/v/(\d+)', url)
+    if m:
+        return f"tiktok:{m.group(1)}"
 
     # YouTube: ?v=xxx or youtu.be/xxx or /shorts/xxx
     m = re.search(r'(?:youtube\.com/.*[?&]v=|youtu\.be/|youtube\.com/shorts/)([\w-]{11})', url)
@@ -357,6 +361,26 @@ _DL_PART_SIZE = 1024 * 1024
 _DL_MAX_PARALLEL = 8
 
 
+def _looks_like_video(path: str, min_bytes: int = 10 * 1024) -> bool:
+    """Проверка, что скачалось видео, а не страница ошибки или заглушка CDN.
+
+    mp4/mov начинаются с бокса ftyp (байты 4..8), webm/mkv — с EBML.
+    Без этой проверки в чат улетало «видео» на 0 МБ с чёрным экраном.
+    """
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) < min_bytes:
+            return False
+        with open(path, "rb") as f:
+            head = f.read(12)
+        ok = head[4:8] == b"ftyp" or head[:4] == bytes([0x1A, 0x45, 0xDF, 0xA3])
+        if not ok:
+            logging.warning(f"Скачанный файл не похож на видео: {head[:12]!r}, "
+                            f"{os.path.getsize(path)} байт")
+        return ok
+    except Exception:
+        return False
+
+
 async def _download_single_stream(session, url: str, output_path: str,
                                   headers: dict | None = None) -> bool:
     async with session.get(url, headers=headers or _DL_HEADERS) as resp:
@@ -366,7 +390,7 @@ async def _download_single_stream(session, url: str, output_path: str,
         with open(output_path, "wb") as f:
             async for chunk in resp.content.iter_chunked(65536):
                 f.write(chunk)
-    return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
+    return _looks_like_video(output_path)
 
 
 async def download_video_direct(url: str, output_path: str,
@@ -389,7 +413,7 @@ async def download_video_direct(url: str, output_path: str,
                 with open(output_path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(65536):
                         f.write(chunk)
-                return os.path.getsize(output_path) > 1000
+                return _looks_like_video(output_path)
             if resp.status != 206:
                 logging.warning(f"Direct download failed: HTTP {resp.status}")
                 return False
@@ -430,7 +454,7 @@ async def download_video_direct(url: str, output_path: str,
                         await asyncio.sleep(0.5 * (attempt + 1))
 
         await asyncio.gather(*(fetch(a, b) for a, b in ranges))
-        return os.path.getsize(output_path) == total and total > 1000
+        return os.path.getsize(output_path) == total and _looks_like_video(output_path)
     except Exception as e:
         logging.error(f"Direct download error: {e}")
         return False
@@ -618,16 +642,32 @@ async def _tikwm_request(url: str, attempts: int = 3) -> dict | None:
 async def resolve_tiktok_short_url(url: str) -> str:
     """vt./vm.tiktok.com → полная ссылка с ID (по редиректу, без скачивания страницы)."""
     session = await get_http_session()
+    timeout = aiohttp.ClientTimeout(total=5)
+    current = url
     try:
-        timeout = aiohttp.ClientTimeout(total=5)
-        async with session.get(url, headers=_IMG_HEADERS, allow_redirects=False,
-                               timeout=timeout) as resp:
-            location = resp.headers.get("Location")
-            if location and extract_video_source_id(location):
-                # Хвост ?_r=1&_t=... не нужен ни tikwm, ни нам
-                return location.split("?")[0]
+        # Идём по цепочке редиректов сами, не скачивая страниц. Бывает
+        # vt.tiktok.com → www.tiktok.com/@user/video/ID, а бывает
+        # vt.tiktok.com → m.tiktok.com/v/ID.html → www.tiktok.com/@/video/ID
+        for _ in range(3):
+            async with session.get(current, headers=_IMG_HEADERS, allow_redirects=False,
+                                   timeout=timeout) as resp:
+                location = resp.headers.get("Location")
+            if not location:
+                break
+            current = location
+            # Хвост ?_r=1&_t=... не нужен ни tikwm, ни нам
+            clean = current.split("?")[0]
+            m = re.search(r'tiktok\.com/@([^/]*)/(?:video|photo)/(\d+)', clean)
+            if m and m.group(1):
+                return clean
+            source_id = extract_video_source_id(clean)
+            if source_id:
+                # ID есть, а автора в ссылке нет — каноничная ссылка; TikTok
+                # и tikwm принимают /video/ и для фото-постов
+                return f"https://www.tiktok.com/@_/video/{source_id.split(':', 1)[1]}"
+        logging.warning(f"Не удалось раскрыть {url}: остановился на {current}")
     except Exception as e:
-        logging.debug(f"Не удалось раскрыть {url}: {e}")
+        logging.warning(f"Не удалось раскрыть {url}: {e}")
     return url
 
 
@@ -798,9 +838,9 @@ async def analyze_tiktok_content(url: str, output_path: str | None = None) -> Ti
         return result
 
     # Сначала свой парсер страницы — он в 3 раза быстрее tikwm
-    m = re.search(r'tiktok\.com/.*/(?:video|photo)/(\d+)', url)
-    if m and output_path and tt_scraper_active():
-        scraped = await scrape_tiktok_content(m.group(1), output_path)
+    source_id = extract_video_source_id(url)
+    if source_id and source_id.startswith("tiktok:") and output_path and tt_scraper_active():
+        scraped = await scrape_tiktok_content(source_id.split(":", 1)[1], output_path)
         if scraped:
             return scraped
         # Наполовину скачанное не оставляем
@@ -1397,7 +1437,8 @@ async def process_url(message: Message, url: str):
                     direct_ok = True  # свой парсер уже скачал (время — в tiktok_page)
                 else:
                     direct_ok = await download_video_direct(content.video_url, output_path)
-                    mark("download")
+                    size_mb = os.path.getsize(output_path) / 1024 / 1024 if direct_ok else 0
+                    mark(f"download({size_mb:.1f}MB)")
                 if direct_ok:
                     # Видео скачано напрямую — отправляем
                     shame_caption = _build_shame_caption()
