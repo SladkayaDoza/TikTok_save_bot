@@ -29,6 +29,7 @@ class VideoRecord(Base):
     video_source_id = Column(String, nullable=True, index=True)   # "tiktok:7234567890"
     direct_url = Column(String, nullable=True)                     # Прямая ссылка на медиа
     telegram_file_id = Column(String, nullable=True, index=True)  # file_id от Telegram
+    telegram_file_type = Column(String, nullable=True)            # video | photo | animation | document
 
 
 class ReactionRecord(Base):
@@ -119,6 +120,7 @@ def _migrate_db():
         "video_source_id": "TEXT",
         "direct_url": "TEXT",
         "telegram_file_id": "TEXT",
+        "telegram_file_type": "TEXT",
     }
 
     for col, col_type in migrations.items():
@@ -198,7 +200,8 @@ def add_video_record(chat_id: int, user_id: int, username: str, url: str,
 
 
 def update_bot_message_id(record_id: int, bot_message_id: int,
-                          telegram_file_id: str = None):
+                          telegram_file_id: str = None,
+                          telegram_file_type: str = None):
     """Update the bot_message_id (and optionally telegram_file_id) after the video is sent."""
     session = Session()
     try:
@@ -207,6 +210,8 @@ def update_bot_message_id(record_id: int, bot_message_id: int,
             record.bot_message_id = bot_message_id
             if telegram_file_id:
                 record.telegram_file_id = telegram_file_id
+            if telegram_file_type:
+                record.telegram_file_type = telegram_file_type
             session.commit()
     except Exception as e:
         session.rollback()
@@ -244,6 +249,51 @@ def find_duplicate(chat_id: int, video_source_id: str) -> dict | None:
         return None
     except Exception as e:
         logging.error(f"Failed to find duplicate: {e}")
+        return None
+    finally:
+        session.close()
+
+
+# Записи до появления telegram_file_type: тип читается из префикса file_id
+# (первый байт base64 — тип файла в Telegram)
+_FILE_ID_PREFIXES = {"BAAC": "video", "AgAC": "photo", "CgAC": "animation", "BQAC": "document"}
+
+
+def _guess_file_type(file_id: str | None) -> str | None:
+    return _FILE_ID_PREFIXES.get((file_id or "")[:4])
+
+
+def find_cached_media(video_source_id: str) -> dict | None:
+    """Последний отправленный ботом file_id этого видео (из любого чата).
+
+    file_id привязан к боту, а не к чату, поэтому годится везде. Берём
+    самый свежий: старые file_id Telegram иногда перестаёт принимать.
+    """
+    if not video_source_id:
+        return None
+    session = Session()
+    try:
+        record = (
+            session.query(VideoRecord)
+            .filter(
+                VideoRecord.video_source_id == video_source_id,
+                VideoRecord.telegram_file_id.isnot(None),
+            )
+            .order_by(VideoRecord.id.desc())
+            .first()
+        )
+        if not record:
+            return None
+        file_type = record.telegram_file_type or _guess_file_type(record.telegram_file_id)
+        if not file_type:
+            return None
+        return {
+            "file_id": record.telegram_file_id,
+            "file_type": file_type,
+            "direct_url": record.direct_url,
+        }
+    except Exception as e:
+        logging.error(f"Failed to find cached media: {e}")
         return None
     finally:
         session.close()

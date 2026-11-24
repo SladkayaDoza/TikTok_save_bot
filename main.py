@@ -19,6 +19,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
     Message, FSInputFile, InputMediaVideo, InputMediaPhoto,
+    InputMediaAnimation, InputMediaDocument,
     MessageReactionUpdated,
 )
 import yt_dlp
@@ -31,6 +32,7 @@ from database import (
     sync_user_reactions, get_chat_stats, find_duplicate,
     get_embedding_details, get_video_id_by_message, retry_failed_jobs,
     get_video_record_by_message, get_message_reaction_count,
+    find_cached_media,
 )
 import embedding
 import transcription
@@ -292,6 +294,7 @@ class TikTokContent:
     photo_paths: list[str] = field(default_factory=list)  # Пути к скачанным фото
     direct_url: str | None = None         # Прямая ссылка для сохранения в БД
     video_source_id: str | None = None    # "tiktok:7234567890"
+    photo_total: int = 0                  # Сколько фото в посте (для «скачано N из M»)
 
 
 def extract_video_source_id(url: str) -> str | None:
@@ -453,18 +456,21 @@ def get_media_from_message(message: Message) -> tuple[str, str] | None:
 #  TIKTOK CONTENT ANALYSIS (фото/видео определение + прямые ссылки)
 # =====================================================================
 
-async def _download_image_list(image_urls: list[str], source_name: str) -> list[str]:
-    """Скачивает список изображений по URL. Возвращает пути к файлам."""
-    session = await get_http_session()
-    downloaded = []
-    for i, img_url in enumerate(image_urls[:10]):
+_IMG_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+
+async def _download_one_image(session: aiohttp.ClientSession, img_url: str,
+                              index: int, source_name: str, attempts: int = 3) -> str | None:
+    """Скачивает одно изображение с повторами. Возвращает путь или None."""
+    timeout = aiohttp.ClientTimeout(total=20)
+    for attempt in range(1, attempts + 1):
         try:
-            async with session.get(img_url) as img_resp:
+            async with session.get(img_url, headers=_IMG_HEADERS, timeout=timeout) as img_resp:
                 if img_resp.status != 200:
-                    continue
+                    raise RuntimeError(f"HTTP {img_resp.status}")
                 content = await img_resp.read()
                 if not content or len(content) < 100:
-                    continue
+                    raise RuntimeError("пустой ответ")
                 ct = img_resp.headers.get("Content-Type", "")
                 ext = ".jpg"
                 if "png" in ct:
@@ -474,15 +480,85 @@ async def _download_image_list(image_urls: list[str], source_name: str) -> list[
                 photo_path = os.path.join(TEMP_DIR, f"photo_{uuid.uuid4()}{ext}")
                 with open(photo_path, "wb") as f:
                     f.write(content)
-                if os.path.getsize(photo_path) > 0:
-                    downloaded.append(photo_path)
+                return photo_path
         except Exception as e:
-            logging.error(f"Error downloading photo {i} via {source_name}: {e}")
+            logging.warning(f"Photo {index} via {source_name}, попытка {attempt}/{attempts}: {e}")
+            if attempt < attempts:
+                await asyncio.sleep(attempt)
+    return None
+
+
+async def _download_image_list(image_urls: list[str], source_name: str) -> list[str]:
+    """Скачивает ВСЕ изображения параллельно (порядок сохраняется), с повторами.
+    Возвращает пути к успешно скачанным файлам."""
+    session = await get_http_session()
+    results = await asyncio.gather(*(
+        _download_one_image(session, u, i, source_name)
+        for i, u in enumerate(image_urls)
+    ))
+    downloaded = [p for p in results if p]
+    if len(downloaded) < len(image_urls):
+        logging.error(f"{source_name}: скачано {len(downloaded)} из {len(image_urls)} фото")
     return downloaded
 
 
+# tikwm бесплатно пускает ~1 запрос в секунду — несколько ссылок подряд
+# выстраиваем в очередь, а не получаем отказ
+_tikwm_lock = asyncio.Lock()
+_tikwm_last_call = 0.0
+
+
+async def _tikwm_request(url: str, attempts: int = 3) -> dict | None:
+    """Запрос к tikwm с повторами. Отвечает он за 3-5 секунд, поэтому таймаут щедрый."""
+    global _tikwm_last_call
+    session = await get_http_session()
+    timeout = aiohttp.ClientTimeout(total=15)
+    loop = asyncio.get_running_loop()
+    for attempt in range(1, attempts + 1):
+        try:
+            async with _tikwm_lock:
+                wait = 1.1 - (loop.time() - _tikwm_last_call)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                try:
+                    async with session.post(
+                        "https://www.tikwm.com/api/", data={"url": url, "hd": 1},
+                        headers=_IMG_HEADERS, timeout=timeout,
+                    ) as resp:
+                        if resp.status != 200:
+                            raise RuntimeError(f"HTTP {resp.status}")
+                        api_data = await resp.json(content_type=None)
+                finally:
+                    _tikwm_last_call = loop.time()
+            if api_data.get("code") == 0 and api_data.get("data"):
+                return api_data["data"]
+            raise RuntimeError(f"code={api_data.get('code')} msg={api_data.get('msg')}")
+        except Exception as e:
+            kind = "timeout" if isinstance(e, asyncio.TimeoutError) else str(e)
+            logging.warning(f"tikwm, попытка {attempt}/{attempts} для {url}: {kind}")
+            if attempt < attempts:
+                await asyncio.sleep(attempt)
+    return None
+
+
+async def resolve_tiktok_short_url(url: str) -> str:
+    """vt./vm.tiktok.com → полная ссылка с ID (по редиректу, без скачивания страницы)."""
+    session = await get_http_session()
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with session.get(url, headers=_IMG_HEADERS, allow_redirects=False,
+                               timeout=timeout) as resp:
+            location = resp.headers.get("Location")
+            if location and extract_video_source_id(location):
+                # Хвост ?_r=1&_t=... не нужен ни tikwm, ни нам
+                return location.split("?")[0]
+    except Exception as e:
+        logging.debug(f"Не удалось раскрыть {url}: {e}")
+    return url
+
+
 async def analyze_tiktok_content(url: str) -> TikTokContent:
-    """Анализирует TikTok URL через tikwm API (быстро, с таймаутами).
+    """Анализирует TikTok URL через tikwm API.
     Определяет тип контента (фото/видео), извлекает прямые ссылки.
     Для фото — скачивает файлы. Для видео — возвращает direct URL.
     НЕ использует yt-dlp для анализа — только лёгкие HTTP API."""
@@ -492,81 +568,37 @@ async def analyze_tiktok_content(url: str) -> TikTokContent:
     if not TIKTOK_URL_REGEX.match(url):
         return result
 
-    session = await get_http_session()
+    data = await _tikwm_request(url)
+    if not data:
+        logging.error(f"tikwm не ответил для {url}, пробуем yt-dlp")
+        return result
 
-    # --- Метод 1: tikwm.com API (основной) — таймаут 4 сек ---
-    try:
-        api_url = "https://www.tikwm.com/api/"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        timeout = aiohttp.ClientTimeout(total=4)
-        async with session.post(api_url, data={"url": url, "hd": 1}, headers=headers, timeout=timeout) as resp:
-            if resp.status == 200:
-                api_data = await resp.json()
-                if api_data.get("code") == 0:
-                    data = api_data.get("data", {})
+    # Извлекаем video_source_id из API (работает даже для vm.tiktok.com)
+    tiktok_id = data.get("id")
+    if tiktok_id:
+        result.video_source_id = f"tiktok:{tiktok_id}"
 
-                    # Извлекаем video_source_id из API (работает даже для vm.tiktok.com)
-                    tiktok_id = data.get("id")
-                    if tiktok_id:
-                        result.video_source_id = f"tiktok:{tiktok_id}"
+    images = data.get("images") or []
+    real_images = [img for img in images if isinstance(img, str) and img.startswith("http")]
 
-                    images = data.get("images", [])
+    if real_images:
+        # ===== ФОТО-ПОСТ =====
+        result.content_type = "photos"
+        result.photo_total = len(real_images)
+        result.direct_url = real_images[0]
+        result.photo_paths = await _download_image_list(real_images, "tikwm")
+        logging.info(f"TikTok slideshow via tikwm: {len(result.photo_paths)}/{len(real_images)} photos")
+        return result
 
-                    if images and isinstance(images, list) and len(images) > 0:
-                        # ===== ФОТО-ПОСТ =====
-                        real_images = [img for img in images if isinstance(img, str) and img.startswith("http")]
-                        if real_images:
-                            downloaded = await _download_image_list(real_images, "tikwm")
-                            if downloaded:
-                                result.content_type = "photos"
-                                result.photo_paths = downloaded
-                                result.direct_url = real_images[0]
-                                logging.info(f"TikTok photo slideshow via tikwm: {len(downloaded)} photos")
-                                return result
-                    else:
-                        # ===== ВИДЕО-ПОСТ =====
-                        video_url = data.get("hdplay") or data.get("play")
-                        if video_url and video_url.startswith("http"):
-                            result.content_type = "video"
-                            result.video_url = video_url
-                            result.direct_url = data.get("play") or video_url
-                            logging.info(f"TikTok video direct URL via tikwm (fast path)")
-                            return result
-                        else:
-                            # tikwm определил что видео, но не дал ссылку — yt-dlp скачает
-                            result.content_type = "video"
-                            logging.debug(f"tikwm: video post, no play URL — yt-dlp fallback")
-                            return result
-    except asyncio.TimeoutError:
-        logging.warning(f"tikwm API timeout (4s) for {url}")
-    except Exception as e:
-        logging.debug(f"tikwm API failed for {url}: {e}")
-
-    # --- Метод 2: tikcdn.io API (резервный, только фото) — таймаут 3 сек ---
-    try:
-        api_url = "https://tikcdn.io/ssstik/video"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-        timeout = aiohttp.ClientTimeout(total=3)
-        async with session.post(api_url, data={"id": url, "locale": "en", "tt": "1"}, headers=headers, timeout=timeout) as resp:
-            if resp.status == 200:
-                text = await resp.text()
-                img_matches = re.findall(r'https?://[^\s"\'<>]+\.(?:jpg|jpeg|png|webp)[^\s"\'<>]*', text)
-                if img_matches:
-                    downloaded = await _download_image_list(img_matches, "tikcdn")
-                    if downloaded:
-                        result.content_type = "photos"
-                        result.photo_paths = downloaded
-                        return result
-    except asyncio.TimeoutError:
-        logging.warning(f"tikcdn API timeout (3s) for {url}")
-    except Exception as e:
-        logging.debug(f"tikcdn API failed for {url}: {e}")
-
-    # Оба API не сработали — возвращаем "unknown", process_url скачает через yt-dlp
-    logging.debug(f"All TikTok APIs failed for {url}, falling back to yt-dlp download")
+    # ===== ВИДЕО-ПОСТ =====
+    result.content_type = "video"
+    video_url = data.get("hdplay") or data.get("play")
+    if video_url and video_url.startswith("http"):
+        result.video_url = video_url
+        result.direct_url = data.get("play") or video_url
+        logging.info("TikTok video direct URL via tikwm (fast path)")
+    else:
+        logging.debug("tikwm: video post, no play URL — yt-dlp fallback")
     return result
 
 
@@ -640,6 +672,7 @@ async def analyze_twitter_content(url: str) -> TikTokContent:
         if downloaded:
             result.content_type = "photos"
             result.photo_paths = downloaded
+            result.photo_total = len(image_urls)
             result.direct_url = image_urls[0]
             logging.info(f"Twitter photos via fxtwitter: {len(downloaded)} photos")
     return result
@@ -716,9 +749,12 @@ def download_video(url: str, output_path: str, max_retries: int = 3):
         # android_vr не поддерживает cookies и молча пропускается, когда задан
         # cookiefile, поэтому держим cookie-совместимые клиенты первыми.
         'extractor_args': {'youtube': {'player_client': ['default', 'android_vr']}},
-        # Конвертация в mp4 через ffmpeg если нужно
+        # Фрагментированные потоки (HLS/DASH: X, YouTube) качаем параллельно
+        'concurrent_fragment_downloads': 8,
+        # Перепаковка в mp4 без перекодирования: секунды вместо минут.
+        # Формат выше и так предпочитает mp4/m4a, перекодировать нечего.
         'postprocessors': [{
-            'key': 'FFmpegVideoConvertor',
+            'key': 'FFmpegVideoRemuxer',
             'preferedformat': 'mp4',
         }],
     }
@@ -780,6 +816,22 @@ async def _update_status(chat_id: int, message_id: int, html_text: str):
         logging.error(f"Failed to update status message: {e}")
 
 
+def _extract_file_info(result) -> tuple[str | None, str | None]:
+    """(file_id, тип) из ответа edit_message_media — тип нужен, чтобы потом
+    переотправить медиа по file_id правильным InputMedia*."""
+    if not isinstance(result, Message):
+        return None, None
+    if result.video:
+        return result.video.file_id, "video"
+    if result.animation:
+        return result.animation.file_id, "animation"
+    if result.photo:
+        return result.photo[-1].file_id, "photo"
+    if result.document:
+        return result.document.file_id, "document"
+    return None, None
+
+
 def _extract_file_id(result) -> str | None:
     """file_id из ответа edit_message_media.
 
@@ -802,7 +854,8 @@ def _extract_file_id(result) -> str | None:
 
 async def _after_send(chat_id: int, rec_id: int, sent_message_id: int | None,
                       media_path: str | None, kind: str = "video",
-                      tg_file_id: str | None = None):
+                      tg_file_id: str | None = None,
+                      tg_file_type: str | None = None):
     """Общий хвост после успешной отправки медиа.
 
     Вызывается ПОСЛЕ того, как видео уже улетело в чат, поэтому на скорость
@@ -812,7 +865,7 @@ async def _after_send(chat_id: int, rec_id: int, sent_message_id: int | None,
         return
 
     if sent_message_id:
-        update_bot_message_id(rec_id, sent_message_id, tg_file_id)
+        update_bot_message_id(rec_id, sent_message_id, tg_file_id, tg_file_type)
 
     if chat_id in embedding_groups and media_path:
         try:
@@ -831,6 +884,14 @@ async def process_url(message: Message, url: str):
         display_name = f"@{user.username}" if user.username else user.full_name
     else:
         display_name = "Unknown"
+
+    is_tiktok = bool(TIKTOK_URL_REGEX.match(url))
+    is_twitter = bool(TWITTER_STATUS_REGEX.match(url))
+    # Короткая ссылка vt./vm.tiktok.com: раскрываем сами (~0.3 с) — так ID
+    # известен сразу (дубликат и кэш срабатывают до tikwm), а tikwm
+    # по полной ссылке отвечает быстрее.
+    if is_tiktok and not extract_video_source_id(url):
+        url = await resolve_tiktok_short_url(url)
 
     domain = get_domain_name(url)
     escaped_url = html.escape(url)
@@ -861,6 +922,21 @@ async def process_url(message: Message, url: str):
     )
     status_msg_id = status_msg.message_id
 
+    # Обновления статуса шлём фоном — работа не ждёт ответа Telegram.
+    # Перед заменой медиа дожидаемся их, иначе запоздавший статус
+    # перезапишет подпись готового видео.
+    status_tasks: list[asyncio.Task] = []
+
+    def _bg_status(html_text: str):
+        status_tasks.append(asyncio.create_task(
+            _update_status(message.chat.id, status_msg_id, html_text)
+        ))
+
+    async def _flush_status():
+        if status_tasks:
+            await asyncio.gather(*status_tasks, return_exceptions=True)
+            status_tasks.clear()
+
     photo_files = []  # для TikTok фото — будем чистить в finally
     direct_url_to_save = None  # Прямая ссылка для сохранения в БД
 
@@ -886,17 +962,56 @@ async def process_url(message: Message, url: str):
         #  TikTok (tikwm API) и X/Twitter (fxtwitter API): анализ контента
         #  Определяет фото/видео + даёт прямые ссылки для скачивания
         # ============================================================
-        is_tiktok = bool(TIKTOK_URL_REGEX.match(url))
-        is_twitter = bool(TWITTER_STATUS_REGEX.match(url))
-        if is_tiktok or is_twitter:
+        # ============================================================
+        #  КЭШ: это видео бот уже отправлял (в любом чате) — шлём по file_id,
+        #  ничего не скачивая. Telegram отдаёт его мгновенно.
+        # ============================================================
+        cached = find_cached_media(video_source_id) if video_source_id else None
+        media_cls = {
+            "video": InputMediaVideo, "photo": InputMediaPhoto,
+            "animation": InputMediaAnimation, "document": InputMediaDocument,
+        }.get(cached["file_type"]) if cached else None
+        if media_cls:
             try:
-                await _update_status(message.chat.id, status_msg_id, (
+                shame_caption = _build_shame_caption()
+                await _flush_status()
+                edited = await bot.edit_message_media(
+                    media=media_cls(
+                        media=cached["file_id"],
+                        caption=shame_caption,
+                        parse_mode="HTML" if shame_caption else None,
+                    ),
+                    chat_id=message.chat.id,
+                    message_id=status_msg_id,
+                )
+                tg_file_id, tg_file_type = _extract_file_info(edited)
+                if user:
+                    rec_id = add_video_record(
+                        chat_id=message.chat.id,
+                        user_id=user.id,
+                        username=display_name,
+                        url=url,
+                        video_source_id=video_source_id,
+                        direct_url=cached.get("direct_url"),
+                    )
+                    # Файла на диске нет — в поисковый индекс эта копия не попадёт
+                    await _after_send(
+                        message.chat.id, rec_id, status_msg_id, None,
+                        kind=cached["file_type"],
+                        tg_file_id=tg_file_id or cached["file_id"],
+                        tg_file_type=tg_file_type or cached["file_type"],
+                    )
+                logging.info(f"Cache hit for {video_source_id}: sent by file_id")
+                return
+            except Exception as cache_err:
+                logging.warning(f"Cached file_id failed for {video_source_id}: {cache_err}")
+
+        if is_tiktok or is_twitter:
+            _bg_status((
                     "<h3>📥 Загрузка медиа</h3>\n"
                     "<p>Статус: 🔍 <b>Определение типа контента...</b></p>\n"
                     f"<p>Источник: <a href=\"{escaped_url}\">{domain}</a></p>"
-                ))
-            except Exception:
-                pass
+            ))
 
             if is_tiktok:
                 content = await analyze_tiktok_content(url)
@@ -919,35 +1034,52 @@ async def process_url(message: Message, url: str):
                 try:
                     sent_message_id = None
                     tg_file_id = None
+                    tg_file_type = None
+
+                    # Не всё скачалось — честно пишем об этом в подписи
+                    caption_parts = []
+                    if shame_caption:
+                        caption_parts.append(shame_caption)
+                    if content.photo_total > len(photo_files):
+                        caption_parts.append(
+                            f"⚠️ Скачалось {len(photo_files)} из {content.photo_total} фото"
+                        )
+                    photo_caption = "\n\n".join(caption_parts) or None
 
                     if len(photo_files) == 1:
                         photo = FSInputFile(photo_files[0])
+                        await _flush_status()
                         edited = await bot.edit_message_media(
                             media=InputMediaPhoto(
                                 media=photo,
-                                caption=shame_caption,
-                                parse_mode="HTML" if shame_caption else None,
+                                caption=photo_caption,
+                                parse_mode="HTML" if photo_caption else None,
                             ),
                             chat_id=message.chat.id,
                             message_id=status_msg_id,
                         )
                         sent_message_id = status_msg_id
-                        tg_file_id = _extract_file_id(edited)
+                        tg_file_id, tg_file_type = _extract_file_info(edited)
                     else:
-                        media_group = [
-                            InputMediaPhoto(media=FSInputFile(p))
-                            for p in photo_files[:10]
-                        ]
-                        # Добавляем shame-подпись к первому фото
-                        if shame_caption:
-                            media_group[0] = InputMediaPhoto(
-                                media=FSInputFile(photo_files[0]),
-                                caption=shame_caption,
-                                parse_mode="HTML",
-                            )
-                        sent_group = await message.reply_media_group(media_group)
-                        if sent_group:
-                            sent_message_id = sent_group[0].message_id
+                        # В альбоме Telegram максимум 10 фото — шлём пачками
+                        chunks = [photo_files[i:i + 10] for i in range(0, len(photo_files), 10)]
+                        # Одиночный хвост в альбом не упаковать — присоединяем к предыдущей пачке
+                        if len(chunks) > 1 and len(chunks[-1]) == 1:
+                            chunks[-2], chunks[-1] = chunks[-2][:-1], chunks[-2][-1:] + chunks[-1]
+                        await _flush_status()
+                        for chunk_index, chunk in enumerate(chunks):
+                            media_group = [InputMediaPhoto(media=FSInputFile(p)) for p in chunk]
+                            if chunk_index == 0 and photo_caption:
+                                media_group[0] = InputMediaPhoto(
+                                    media=FSInputFile(chunk[0]),
+                                    caption=photo_caption,
+                                    parse_mode="HTML",
+                                )
+                            if chunk_index > 0:
+                                await asyncio.sleep(1)  # не упираться в флуд-лимит
+                            sent_group = await message.reply_media_group(media_group)
+                            if chunk_index == 0 and sent_group:
+                                sent_message_id = sent_group[0].message_id
                         await bot.delete_message(
                             chat_id=message.chat.id,
                             message_id=status_msg_id,
@@ -966,30 +1098,34 @@ async def process_url(message: Message, url: str):
                         # и finally ниже уже ничего не найдёт по этому пути.
                         await _after_send(
                             message.chat.id, rec_id, sent_message_id,
-                            photo_files[0], kind="image", tg_file_id=tg_file_id,
+                            photo_files[0], kind="image", tg_file_id=tg_file_id, tg_file_type=tg_file_type,
                         )
                     return  # Успешно отправили фото — выходим
 
                 except Exception as photo_send_err:
                     logging.error(f"Failed to send photos: {photo_send_err}")
+                    if is_tiktok:
+                        # yt-dlp фото-посты TikTok не умеет — фоллбэк бессмысленен
+                        raise RuntimeError(f"не удалось отправить фото: {photo_send_err}")
                     # Фото скачались но не отправились — продолжаем к видео
+
+            if is_tiktok and content.content_type == "photos" and not content.photo_paths:
+                raise RuntimeError("TikTok отдал слайдшоу, но ни одно фото не скачалось")
 
             # --- ВИДЕО: прямое скачивание по ссылке из API (без yt-dlp!) ---
             if content.content_type == "video" and content.video_url:
-                try:
-                    await _update_status(message.chat.id, status_msg_id, (
+                _bg_status((
                         "<h3>📥 Загрузка медиа</h3>\n"
                         "<p>Статус: 🟡 <b>Скачивание видео (fast)...</b></p>\n"
                         f"<p>Источник: <a href=\"{escaped_url}\">{domain}</a></p>"
-                    ))
-                except Exception:
-                    pass
+                ))
 
                 direct_ok = await download_video_direct(content.video_url, output_path)
                 if direct_ok:
                     # Видео скачано напрямую — отправляем
                     shame_caption = _build_shame_caption()
                     video = FSInputFile(output_path)
+                    await _flush_status()
                     edited = await bot.edit_message_media(
                         media=InputMediaVideo(
                             media=video,
@@ -1000,7 +1136,7 @@ async def process_url(message: Message, url: str):
                         message_id=status_msg_id,
                     )
                     sent_message_id = status_msg_id
-                    tg_file_id = _extract_file_id(edited)
+                    tg_file_id, tg_file_type = _extract_file_info(edited)
 
                     if user:
                         rec_id = add_video_record(
@@ -1013,7 +1149,7 @@ async def process_url(message: Message, url: str):
                         )
                         await _after_send(
                             message.chat.id, rec_id, sent_message_id,
-                            output_path, kind="video", tg_file_id=tg_file_id,
+                            output_path, kind="video", tg_file_id=tg_file_id, tg_file_type=tg_file_type,
                         )
                     return  # Успешно — выходим
 
@@ -1024,14 +1160,11 @@ async def process_url(message: Message, url: str):
         # ============================================================
         #  Скачиваем видео через yt-dlp (YouTube, Instagram, TikTok/X fallback)
         # ============================================================
-        try:
-            await _update_status(message.chat.id, status_msg_id, (
+        _bg_status((
                 "<h3>📥 Загрузка медиа</h3>\n"
                 "<p>Статус: 🟡 <b>Скачивание видео...</b></p>\n"
                 f"<p>Источник: <a href=\"{escaped_url}\">{domain}</a></p>"
-            ))
-        except Exception:
-            pass
+        ))
 
         await asyncio.wait_for(
             asyncio.to_thread(download_video, url, output_path),
@@ -1044,6 +1177,7 @@ async def process_url(message: Message, url: str):
         if os.path.exists(actual_path) and status_msg_id:
             shame_caption = _build_shame_caption()
             video = FSInputFile(actual_path)
+            await _flush_status()
             edited = await bot.edit_message_media(
                 media=InputMediaVideo(
                     media=video,
@@ -1054,7 +1188,7 @@ async def process_url(message: Message, url: str):
                 message_id=status_msg_id,
             )
             sent_message_id = status_msg_id
-            tg_file_id = _extract_file_id(edited)
+            tg_file_id, tg_file_type = _extract_file_info(edited)
 
             if user:
                 rec_id = add_video_record(
@@ -1067,7 +1201,7 @@ async def process_url(message: Message, url: str):
                 )
                 await _after_send(
                     message.chat.id, rec_id, sent_message_id,
-                    actual_path, kind="video", tg_file_id=tg_file_id,
+                    actual_path, kind="video", tg_file_id=tg_file_id, tg_file_type=tg_file_type,
                 )
         else:
             error_html = (
@@ -1077,6 +1211,7 @@ async def process_url(message: Message, url: str):
                 "<p>Детали: <i>Файл не был найден на диске.</i></p>"
             )
             if status_msg_id:
+                await _flush_status()
                 await _update_status(message.chat.id, status_msg_id, error_html)
 
     except (asyncio.TimeoutError, yt_dlp.utils.DownloadError, Exception) as e:
@@ -1092,6 +1227,14 @@ async def process_url(message: Message, url: str):
                 "<p>Загрузка файла заняла слишком много времени и была прервана.</p>\n"
                 "<hr/>\n"
                 "<p>Пожалуйста, попробуйте отправить ссылку ещё раз позже.</p>"
+            )
+        elif is_download_err and re.search(r'tiktok\.com/@[^/\s]+/photo/', str(e)):
+            # tikwm не ответил, а yt-dlp слайдшоу TikTok не поддерживает
+            error_html = (
+                "<h3>❌ Ошибка загрузки</h3>\n"
+                "<p>Это фото-пост TikTok, а сервис для скачивания фото сейчас не отвечает.</p>\n"
+                "<hr/>\n"
+                "<p>Попробуй отправить ссылку ещё раз через минуту.</p>"
             )
         elif is_download_err:
             # yt-dlp красит текст ANSI-кодами ("\x1b[0;31mERROR:\x1b[0m") — в чате это мусор
@@ -1115,6 +1258,7 @@ async def process_url(message: Message, url: str):
 
         logging.error(f"Error processing {url}: {e}")
         if status_msg_id:
+            await _flush_status()
             await _update_status(message.chat.id, status_msg_id, error_html)
 
     finally:
