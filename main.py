@@ -8,10 +8,11 @@ import html
 import re
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 import subprocess
 import sys
+import time
 import requests as http_requests
 import aiohttp
 from io import BytesIO
@@ -344,20 +345,82 @@ def get_message_link(chat_id: int, message_id: int,
     return None
 
 
+_DL_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+# CDN TikTok/X режет скорость на одно соединение (~1-2 МБ/с), поэтому
+# файл качаем кусками в несколько параллельных Range-запросов
+_DL_PART_SIZE = 1024 * 1024
+_DL_MAX_PARALLEL = 8
+
+
+async def _download_single_stream(session, url: str, output_path: str) -> bool:
+    async with session.get(url, headers=_DL_HEADERS) as resp:
+        if resp.status != 200:
+            logging.warning(f"Direct download failed: HTTP {resp.status}")
+            return False
+        with open(output_path, "wb") as f:
+            async for chunk in resp.content.iter_chunked(65536):
+                f.write(chunk)
+    return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
+
+
 async def download_video_direct(url: str, output_path: str) -> bool:
     """Скачивает видео напрямую через aiohttp (без yt-dlp).
-    Используется для TikTok видео когда tikwm API даёт прямую ссылку."""
+    Используется, когда API (tikwm / fxtwitter) дал прямую ссылку.
+    Если сервер поддерживает Range — качает в несколько потоков."""
     session = await get_http_session()
+    timeout = aiohttp.ClientTimeout(total=120, sock_read=30)
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200:
+        # Первый кусок заодно сообщает полный размер (Content-Range: bytes 0-N/TOTAL)
+        first_end = _DL_PART_SIZE - 1
+        async with session.get(url, headers={**_DL_HEADERS, "Range": f"bytes=0-{first_end}"},
+                               timeout=timeout) as resp:
+            if resp.status == 200:
+                # Range не поддерживается — сервер отдаёт файл целиком, просто дочитываем
+                with open(output_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(65536):
+                        f.write(chunk)
+                return os.path.getsize(output_path) > 1000
+            if resp.status != 206:
                 logging.warning(f"Direct download failed: HTTP {resp.status}")
                 return False
-            with open(output_path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(65536):
-                    f.write(chunk)
-            return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
+            total = int((resp.headers.get("Content-Range") or "").rsplit("/", 1)[-1] or 0)
+            first_part = await resp.read()
+
+        if total <= 0:
+            return await _download_single_stream(session, url, output_path)
+
+        with open(output_path, "wb") as f:
+            f.truncate(total)
+            f.write(first_part)
+
+        ranges = [(start, min(start + _DL_PART_SIZE, total) - 1)
+                  for start in range(len(first_part), total, _DL_PART_SIZE)]
+        sem = asyncio.Semaphore(_DL_MAX_PARALLEL)
+
+        async def fetch(start: int, end: int):
+            async with sem:
+                for attempt in range(3):
+                    try:
+                        async with session.get(
+                            url, headers={**_DL_HEADERS, "Range": f"bytes={start}-{end}"},
+                            timeout=timeout,
+                        ) as r:
+                            if r.status != 206:
+                                raise RuntimeError(f"HTTP {r.status}")
+                            data = await r.read()
+                        if len(data) != end - start + 1:
+                            raise RuntimeError(f"короткий кусок {len(data)}")
+                        with open(output_path, "r+b") as f:
+                            f.seek(start)
+                            f.write(data)
+                        return
+                    except Exception:
+                        if attempt == 2:
+                            raise
+                        await asyncio.sleep(0.5 * (attempt + 1))
+
+        await asyncio.gather(*(fetch(a, b) for a, b in ranges))
+        return os.path.getsize(output_path) == total and total > 1000
     except Exception as e:
         logging.error(f"Direct download error: {e}")
         return False
@@ -875,6 +938,23 @@ async def _after_send(chat_id: int, rec_id: int, sent_message_id: int | None,
 
 
 async def process_url(message: Message, url: str):
+    # Замер по этапам: одна строка в логе на каждую ссылку (см. finally)
+    t_start = time.monotonic()
+    stages: list[tuple[str, float]] = []
+    last_mark = [t_start]
+
+    def mark(name: str):
+        now = time.monotonic()
+        stages.append((name, now - last_mark[0]))
+        last_mark[0] = now
+
+    # Сколько апдейт шёл от Telegram до бота (date — с точностью до секунды)
+    try:
+        tg_lag = (datetime.now(timezone.utc) - message.date).total_seconds()
+    except Exception:
+        tg_lag = None
+
+    original_url = url
     video_id = str(uuid.uuid4())
     output_path = os.path.join(TEMP_DIR, f"{video_id}.mp4")
 
@@ -890,8 +970,21 @@ async def process_url(message: Message, url: str):
     # Короткая ссылка vt./vm.tiktok.com: раскрываем сами (~0.3 с) — так ID
     # известен сразу (дубликат и кэш срабатывают до tikwm), а tikwm
     # по полной ссылке отвечает быстрее.
+    # Заглушку отправляем сразу, параллельно с раскрытием ссылки и БД
+    stub_html = (
+        "<h3>📥 Загрузка медиа</h3>\n"
+        "<p>Статус: 🟡 <b>Скачивание...</b></p>\n"
+        f"<p>Источник: <a href=\"{html.escape(url)}\">{get_domain_name(url)}</a></p>"
+    )
+    stub_task = asyncio.create_task(send_stub_animation(
+        chat_id=message.chat.id,
+        caption=to_fallback_html(stub_html),
+        reply_to_message_id=message.message_id,
+    ))
+
     if is_tiktok and not extract_video_source_id(url):
         url = await resolve_tiktok_short_url(url)
+        mark("resolve")
 
     domain = get_domain_name(url)
     escaped_url = html.escape(url)
@@ -907,20 +1000,16 @@ async def process_url(message: Message, url: str):
         if duplicate_info:
             is_duplicate = True
 
-    status_html = (
-        "<h3>📥 Загрузка медиа</h3>\n"
-        "<p>Статус: 🟡 <b>Скачивание...</b></p>\n"
-        f"<p>Источник: <a href=\"{escaped_url}\">{domain}</a></p>"
-    )
+    mark("db")
 
-    # Send stub GIF (instant after first upload) — single message, no extra notification
-    fallback_caption = to_fallback_html(status_html)
-    status_msg = await send_stub_animation(
-        chat_id=message.chat.id,
-        caption=fallback_caption,
-        reply_to_message_id=message.message_id,
-    )
+    # Заглушка (1x1 GIF, мгновенно после первой загрузки) — одно сообщение без лишнего уведомления
+    try:
+        status_msg = await stub_task
+    except Exception:
+        logging.info(f"⏱ {original_url}: заглушка не отправилась, tg_lag {tg_lag}")
+        raise
     status_msg_id = status_msg.message_id
+    mark("stub")
 
     # Обновления статуса шлём фоном — работа не ждёт ответа Telegram.
     # Перед заменой медиа дожидаемся их, иначе запоздавший статус
@@ -1001,6 +1090,7 @@ async def process_url(message: Message, url: str):
                         tg_file_id=tg_file_id or cached["file_id"],
                         tg_file_type=tg_file_type or cached["file_type"],
                     )
+                mark("cache_send")
                 logging.info(f"Cache hit for {video_source_id}: sent by file_id")
                 return
             except Exception as cache_err:
@@ -1018,6 +1108,7 @@ async def process_url(message: Message, url: str):
             else:
                 content = await analyze_twitter_content(url)
             direct_url_to_save = content.direct_url
+            mark("tikwm" if is_tiktok else "fxtwitter")
 
             # Если API дал video_source_id (работает для коротких ссылок vm.tiktok.com)
             if not video_source_id and content.video_source_id:
@@ -1060,6 +1151,7 @@ async def process_url(message: Message, url: str):
                         )
                         sent_message_id = status_msg_id
                         tg_file_id, tg_file_type = _extract_file_info(edited)
+                        mark("upload")
                     else:
                         # В альбоме Telegram максимум 10 фото — шлём пачками
                         chunks = [photo_files[i:i + 10] for i in range(0, len(photo_files), 10)]
@@ -1080,6 +1172,7 @@ async def process_url(message: Message, url: str):
                             sent_group = await message.reply_media_group(media_group)
                             if chunk_index == 0 and sent_group:
                                 sent_message_id = sent_group[0].message_id
+                        mark("upload")
                         await bot.delete_message(
                             chat_id=message.chat.id,
                             message_id=status_msg_id,
@@ -1121,6 +1214,7 @@ async def process_url(message: Message, url: str):
                 ))
 
                 direct_ok = await download_video_direct(content.video_url, output_path)
+                mark("download")
                 if direct_ok:
                     # Видео скачано напрямую — отправляем
                     shame_caption = _build_shame_caption()
@@ -1137,6 +1231,7 @@ async def process_url(message: Message, url: str):
                     )
                     sent_message_id = status_msg_id
                     tg_file_id, tg_file_type = _extract_file_info(edited)
+                    mark("upload")
 
                     if user:
                         rec_id = add_video_record(
@@ -1171,6 +1266,7 @@ async def process_url(message: Message, url: str):
             timeout=180,
         )
 
+        mark("yt-dlp")
         found_files = glob.glob(os.path.join(TEMP_DIR, f"{video_id}*"))
         actual_path = found_files[0] if found_files else output_path
 
@@ -1189,6 +1285,7 @@ async def process_url(message: Message, url: str):
             )
             sent_message_id = status_msg_id
             tg_file_id, tg_file_type = _extract_file_info(edited)
+            mark("upload")
 
             if user:
                 rec_id = add_video_record(
@@ -1262,6 +1359,10 @@ async def process_url(message: Message, url: str):
             await _update_status(message.chat.id, status_msg_id, error_html)
 
     finally:
+        total = time.monotonic() - t_start
+        parts = " | ".join(f"{name} {sec:.2f}" for name, sec in stages)
+        lag = f"{tg_lag:.1f}s" if tg_lag is not None else "?"
+        logging.info(f"⏱ {original_url}: total {total:.2f}s (tg_lag {lag}) | {parts}")
         for f in glob.glob(os.path.join(TEMP_DIR, f"{video_id}*")):
             try:
                 os.remove(f)
@@ -1559,7 +1660,7 @@ def _human_when(dt) -> str | None:
     """Дату из БД в человеческий вид: «только что», «25 мин назад», «вчера, 18:04»."""
     if not dt:
         return None
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     delta = now - dt
     minutes = delta.total_seconds() / 60
     if minutes < 1:
