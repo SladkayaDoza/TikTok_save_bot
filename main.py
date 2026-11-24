@@ -720,23 +720,31 @@ def _tiktok_video_candidates(video: dict) -> list[str]:
 # на него время у каждой ссылки — на полчаса идём сразу в tikwm
 _TT_FAIL_LIMIT = 3
 _TT_COOLDOWN_SEC = 30 * 60
+_TT_COOLDOWN_MAX_SEC = 24 * 3600
 _tt_fail_streak = 0
 _tt_disabled_until = 0.0
+# Пауза растёт с каждым срабатыванием подряд (30 мин → 1 ч → ... → 24 ч):
+# там, где CDN отказывает всегда, парсер почти перестаёт пробовать,
+# а единичный сбой не выключает его надолго
+_tt_cooldown = _TT_COOLDOWN_SEC
 
 
 def _tt_scraper_failed(reason: str):
-    global _tt_fail_streak, _tt_disabled_until
+    global _tt_fail_streak, _tt_disabled_until, _tt_cooldown
     _tt_fail_streak += 1
     if _tt_fail_streak >= _TT_FAIL_LIMIT:
-        _tt_disabled_until = time.monotonic() + _TT_COOLDOWN_SEC
-        _tt_fail_streak = 0
+        _tt_disabled_until = time.monotonic() + _tt_cooldown
         logging.error(f"Свой парсер TikTok {_TT_FAIL_LIMIT} раза подряд не смог скачать "
-                      f"({reason}) — на {_TT_COOLDOWN_SEC // 60} мин работаем через tikwm")
+                      f"({reason}) — на {_tt_cooldown // 60} мин работаем через tikwm")
+        _tt_cooldown = min(_tt_cooldown * 2, _TT_COOLDOWN_MAX_SEC)
+        # После паузы хватит одной неудачи, чтобы снова уйти на паузу (уже длиннее)
+        _tt_fail_streak = _TT_FAIL_LIMIT - 1
 
 
 def _tt_scraper_ok():
-    global _tt_fail_streak
+    global _tt_fail_streak, _tt_cooldown
     _tt_fail_streak = 0
+    _tt_cooldown = _TT_COOLDOWN_SEC
 
 
 def tt_scraper_active() -> bool:
@@ -837,18 +845,23 @@ async def analyze_tiktok_content(url: str, output_path: str | None = None) -> Ti
     if not TIKTOK_URL_REGEX.match(url):
         return result
 
-    # Сначала свой парсер страницы — он в 3 раза быстрее tikwm
+    # Свой парсер страницы и tikwm запускаем ОДНОВРЕМЕННО: парсер быстрее,
+    # но на части серверов (IP дата-центра) CDN TikTok отвечает ему 403.
+    # Тогда ответ tikwm уже почти готов и неудачная попытка ничего не стоит;
+    # если парсер справился — запрос к tikwm просто отменяем.
+    tikwm_task = asyncio.create_task(_tikwm_request(url))
     source_id = extract_video_source_id(url)
     if source_id and source_id.startswith("tiktok:") and output_path and tt_scraper_active():
         scraped = await scrape_tiktok_content(source_id.split(":", 1)[1], output_path)
         if scraped:
+            tikwm_task.cancel()
             return scraped
         # Наполовину скачанное не оставляем
         if os.path.exists(output_path):
             os.remove(output_path)
 
     result.via = "tikwm"
-    data = await _tikwm_request(url)
+    data = await tikwm_task
     if not data:
         logging.error(f"tikwm не ответил для {url}, пробуем yt-dlp")
         return result
